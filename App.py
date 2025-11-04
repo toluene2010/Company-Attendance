@@ -1,4 +1,3 @@
-import os
 import streamlit as st
 import pandas as pd
 import datetime
@@ -8,7 +7,7 @@ import base64
 import os
 import json
 import calendar
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, Boolean, Date, DateTime, ForeignKey
 import psycopg2
 
 # ==================== CONFIGURATION ====================
@@ -28,7 +27,7 @@ except Exception:
     DB_PORT = os.getenv("DB_PORT", "5432")
     DB_NAME = os.getenv("DB_NAME", "Company_Attendance_subjectlet")
 
-# Create database connection URL
+# Create database connection URL with schema
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # ==================== DATABASE CONNECTION ====================
@@ -73,7 +72,7 @@ def read_table(table_name):
         return pd.DataFrame()
     
     try:
-        query = f"SELECT * FROM {table_name}"
+        query = f"SELECT * FROM public.{table_name}"
         df = pd.read_sql(query, engine)
         return df
     except Exception as e:
@@ -88,112 +87,146 @@ def write_table(table_name, df):
     
     try:
         # Replace the entire table content
-        df.to_sql(table_name, engine, if_exists='replace', index=False)
+        df.to_sql(table_name, engine, if_exists='replace', index=False, schema='public')
         return True
     except Exception as e:
         st.error(f"Error writing to table {table_name}: {e}")
         return False
 
+def table_exists(table_name):
+    """Check if a table exists in the database"""
+    engine = get_db_connection()
+    if engine is None:
+        return False
+    
+    try:
+        with engine.connect() as conn:
+            query = text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'public' 
+                    AND table_name = :table_name
+                )
+            """)
+            result = conn.execute(query, {"table_name": table_name})
+            return result.scalar()
+    except Exception as e:
+        st.error(f"Error checking if table {table_name} exists: {e}")
+        return False
+
 # ==================== INITIALIZATION ====================
 def initialize_system():
     """Create tables if they don't exist"""
-    # Create tables if they don't exist
-    tables = {
-        "Shifts": """
-            CREATE TABLE IF NOT EXISTS Shifts (
-                ID INTEGER PRIMARY KEY,
-                Name VARCHAR(255) NOT NULL
-            )
-        """,
-        "Sections": """
-            CREATE TABLE IF NOT EXISTS Sections (
-                ID INTEGER PRIMARY KEY,
-                Name VARCHAR(255) NOT NULL,
-                Description TEXT
-            )
-        """,
-        "Departments": """
-            CREATE TABLE IF NOT EXISTS Departments (
-                ID INTEGER PRIMARY KEY,
-                Name VARCHAR(255) NOT NULL,
-                Section_ID INTEGER,
-                Description TEXT,
-                FOREIGN KEY (Section_ID) REFERENCES Sections(ID)
-            )
-        """,
-        "Users": """
-            CREATE TABLE IF NOT EXISTS Users (
-                ID INTEGER PRIMARY KEY,
-                Name VARCHAR(255) NOT NULL,
-                Username VARCHAR(255) NOT NULL UNIQUE,
-                Password VARCHAR(255) NOT NULL,
-                Role VARCHAR(50) NOT NULL,
-                Active BOOLEAN DEFAULT TRUE,
-                Assigned_Section VARCHAR(255),
-                Assigned_Shift VARCHAR(255)
-            )
-        """,
-        "Workers": """
-            CREATE TABLE IF NOT EXISTS Workers (
-                ID INTEGER PRIMARY KEY,
-                Name VARCHAR(255) NOT NULL,
-                Section VARCHAR(255),
-                Department VARCHAR(255),
-                Shift VARCHAR(255),
-                Active BOOLEAN DEFAULT TRUE
-            )
-        """,
-        "Attendance": """
-            CREATE TABLE IF NOT EXISTS Attendance (
-                ID INTEGER PRIMARY KEY,
-                Worker_ID INTEGER,
-                Worker_Name VARCHAR(255) NOT NULL,
-                Date DATE NOT NULL,
-                Section VARCHAR(255),
-                Department VARCHAR(255),
-                Shift VARCHAR(255),
-                Status VARCHAR(50) NOT NULL,
-                Timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (Worker_ID) REFERENCES Workers(ID)
-            )
-        """
-    }
+    engine = get_db_connection()
+    if engine is None:
+        st.error("Cannot connect to database. System initialization failed.")
+        return
     
-    # Create tables
-    for table_name, query in tables.items():
-        execute_query(query)
+    # Create tables if they don't exist
+    metadata = MetaData()
+    
+    # Define tables
+    shifts = Table(
+        'shifts', metadata,
+        Column('ID', Integer, primary_key=True),
+        Column('Name', String(255), nullable=False),
+        schema='public'
+    )
+    
+    sections = Table(
+        'sections', metadata,
+        Column('ID', Integer, primary_key=True),
+        Column('Name', String(255), nullable=False),
+        Column('Description', String(500)),
+        schema='public'
+    )
+    
+    departments = Table(
+        'departments', metadata,
+        Column('ID', Integer, primary_key=True),
+        Column('Name', String(255), nullable=False),
+        Column('Section_ID', Integer),
+        Column('Description', String(500)),
+        schema='public'
+    )
+    
+    users = Table(
+        'users', metadata,
+        Column('ID', Integer, primary_key=True),
+        Column('Name', String(255), nullable=False),
+        Column('Username', String(255), nullable=False, unique=True),
+        Column('Password', String(255), nullable=False),
+        Column('Role', String(50), nullable=False),
+        Column('Active', Boolean, default=True),
+        Column('Assigned_Section', String(255)),
+        Column('Assigned_Shift', String(255)),
+        schema='public'
+    )
+    
+    workers = Table(
+        'workers', metadata,
+        Column('ID', Integer, primary_key=True),
+        Column('Name', String(255), nullable=False),
+        Column('Section', String(255)),
+        Column('Department', String(255)),
+        Column('Shift', String(255)),
+        Column('Active', Boolean, default=True),
+        schema='public'
+    )
+    
+    attendance = Table(
+        'attendance', metadata,
+        Column('ID', Integer, primary_key=True),
+        Column('Worker_ID', Integer),
+        Column('Worker_Name', String(255), nullable=False),
+        Column('Date', Date, nullable=False),
+        Column('Section', String(255)),
+        Column('Department', String(255)),
+        Column('Shift', String(255)),
+        Column('Status', String(50), nullable=False),
+        Column('Timestamp', DateTime, default=datetime.datetime.now),
+        schema='public'
+    )
+    
+    # Create tables in the database
+    try:
+        metadata.create_all(engine)
+        st.success("Database tables created successfully!")
+    except Exception as e:
+        st.error(f"Error creating database tables: {e}")
+        return
     
     # Check if tables have data and insert default data if empty
     # Shifts
-    shifts = read_table("Shifts")
-    if shifts.empty:
+    shifts_df = read_table("shifts")
+    if shifts_df.empty:
         shifts_df = pd.DataFrame({'ID':[1,2,3],'Name':['Morning','Afternoon','General']})
-        write_table("Shifts", shifts_df)
+        write_table("shifts", shifts_df)
     
     # Sections
-    sections = read_table("Sections")
-    if sections.empty:
+    sections_df = read_table("sections")
+    if sections_df.empty:
         sections_df = pd.DataFrame({
             'ID': [1, 2, 3],
             'Name': ['Liquid Section', 'Solid Section', 'Utility Section'],
             'Description': ['Liquid manufacturing', 'Solid manufacturing', 'Utility services']
         })
-        write_table("Sections", sections_df)
+        write_table("sections", sections_df)
     
     # Departments
-    departments = read_table("Departments")
-    if departments.empty:
+    departments_df = read_table("departments")
+    if departments_df.empty:
         departments_df = pd.DataFrame({
             'ID': [1, 2, 3, 4],
             'Name': ['Mixing', 'Filling', 'Packaging', 'Maintenance'],
             'Section_ID': [1, 1, 2, 3],
             'Description': ['Mixing department', 'Filling department', 'Packaging department', 'Maintenance department']
         })
-        write_table("Departments", departments_df)
+        write_table("departments", departments_df)
     
     # Users
-    users = read_table("Users")
-    if users.empty:
+    users_df = read_table("users")
+    if users_df.empty:
         users_df = pd.DataFrame([{
             'ID': 1,
             'Name': 'Admin User',
@@ -204,19 +237,19 @@ def initialize_system():
             'Assigned_Section': '',
             'Assigned_Shift': ''
         }])
-        write_table("Users", users_df)
+        write_table("users", users_df)
     
     # Workers
-    workers = read_table("Workers")
-    if workers.empty:
+    workers_df = read_table("workers")
+    if workers_df.empty:
         workers_df = pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active'])
-        write_table("Workers", workers_df)
+        write_table("workers", workers_df)
     
     # Attendance
-    attendance = read_table("Attendance")
-    if attendance.empty:
+    attendance_df = read_table("attendance")
+    if attendance_df.empty:
         attendance_df = pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp'])
-        write_table("Attendance", attendance_df)
+        write_table("attendance", attendance_df)
 
 # ==================== MOBILE RESPONSIVENESS ====================
 def mobile_responsive_css():
@@ -348,7 +381,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame):
 def generate_attendance_grid(year, month):
     """Generate attendance grid for the selected month and year"""
     # Get all workers
-    workers_df = read_table("Workers")
+    workers_df = read_table("workers")
     
     # Ensure required columns exist
     if 'Active' not in workers_df.columns:
@@ -368,7 +401,7 @@ def generate_attendance_grid(year, month):
         return pd.DataFrame()
     
     # Get attendance data for the selected month and year
-    attendance_df = read_table("Attendance")
+    attendance_df = read_table("attendance")
     
     if attendance_df.empty or 'Date' not in attendance_df.columns:
         return pd.DataFrame()
@@ -440,7 +473,7 @@ def login_page():
         username = st.text_input("Username", key="login_username")
         password = st.text_input("Password", type="password", key="login_password")
         if st.button("Login", type="primary", use_container_width=True):
-            users_df = read_table("Users")
+            users_df = read_table("users")
             if users_df.empty:
                 st.error("No users found. System needs initialization.")
                 return
@@ -471,7 +504,7 @@ def admin_dashboard():
     # ---- Users Tab ----
     with tab1:
         st.subheader("User Management")
-        users_df = read_table("Users")
+        users_df = read_table("users")
         col_a, col_b = st.columns([2,3])
         with col_a:
             st.markdown("#### ➕ Add New User")
@@ -484,7 +517,7 @@ def admin_dashboard():
                 assigned_shift = st.text_input("Assigned Shift (optional)")
                 if st.form_submit_button("Add User"):
                     if name and username and password:
-                        users_df = read_table("Users")
+                        users_df = read_table("users")
                         new_id = int(users_df['ID'].max())+1 if not users_df.empty and 'ID' in users_df.columns else 1
                         new_user = pd.DataFrame([{
                             'ID': new_id,
@@ -497,14 +530,14 @@ def admin_dashboard():
                             'Assigned_Shift': assigned_shift
                         }])
                         users_df = pd.concat([users_df, new_user], ignore_index=True)
-                        if write_table("Users", users_df):
+                        if write_table("users", users_df):
                             st.success("User added")
                             st.rerun()
                     else:
                         st.error("Please fill all fields")
         with col_b:
             st.markdown("#### 📋 All Users")
-            users_df = read_table("Users")
+            users_df = read_table("users")
             if not users_df.empty:
                 users_df = normalize_active_column(users_df,'Active')
                 for _, u in users_df.iterrows():
@@ -519,18 +552,18 @@ def admin_dashboard():
                             if u['Active']=='TRUE':
                                 if st.button("Deactivate", key=f"deact_{u['ID']}"):
                                     users_df.loc[users_df['ID']==u['ID'],'Active'] = False
-                                    write_table("Users", users_df)
+                                    write_table("users", users_df)
                                     st.rerun()
                             else:
                                 if st.button("Activate", key=f"act_{u['ID']}"):
                                     users_df.loc[users_df['ID']==u['ID'],'Active'] = True
-                                    write_table("Users", users_df)
+                                    write_table("users", users_df)
                                     st.rerun()
                         with col2:
                             if u['ID'] != st.session_state.user_id:
                                 if st.button("🗑️ Delete", key=f"del_{u['ID']}"):
                                     users_df = users_df[users_df['ID'] != u['ID']]
-                                    write_table("Users", users_df)
+                                    write_table("users", users_df)
                                     st.rerun()
             else:
                 st.info("No users found")
@@ -538,7 +571,7 @@ def admin_dashboard():
     # ---- Sections Tab ----
     with tab2:
         st.subheader("Sections Management")
-        sections_df = read_table("Sections")
+        sections_df = read_table("sections")
         col1, col2 = st.columns([2,3])
         with col1:
             st.markdown("#### ➕ Add Section")
@@ -547,11 +580,11 @@ def admin_dashboard():
                 desc = st.text_area("Description")
                 if st.form_submit_button("Add Section"):
                     if section_name:
-                        sections_df = read_table("Sections")
+                        sections_df = read_table("sections")
                         new_id = int(sections_df['ID'].max())+1 if not sections_df.empty and 'ID' in sections_df.columns else 1
                         new_section = pd.DataFrame([{'ID':new_id,'Name':section_name,'Description':desc}])
                         sections_df = pd.concat([sections_df, new_section], ignore_index=True)
-                        if write_table("Sections", sections_df):
+                        if write_table("sections", sections_df):
                             st.success("Section added")
                             st.rerun()
                     else:
@@ -566,8 +599,8 @@ def admin_dashboard():
     # ---- Departments Tab ----
     with tab3:
         st.subheader("Departments Management")
-        sections_df = read_table("Sections")
-        departments_df = read_table("Departments")
+        sections_df = read_table("sections")
+        departments_df = read_table("departments")
         col1, col2 = st.columns([2,3])
         with col1:
             st.markdown("#### ➕ Add Department")
@@ -577,11 +610,11 @@ def admin_dashboard():
                 desc = st.text_area("Description")
                 if st.form_submit_button("Add Department"):
                     if dept_name and section_id:
-                        departments_df = read_table("Departments")
+                        departments_df = read_table("departments")
                         new_id = int(departments_df['ID'].max())+1 if not departments_df.empty and 'ID' in departments_df.columns else 1
                         new_department = pd.DataFrame([{'ID':new_id,'Name':dept_name,'Section_ID':section_id,'Description':desc}])
                         departments_df = pd.concat([departments_df, new_department], ignore_index=True)
-                        if write_table("Departments", departments_df):
+                        if write_table("departments", departments_df):
                             st.success("Department added")
                             st.rerun()
                     else:
@@ -609,10 +642,10 @@ def admin_dashboard():
     # ---- Workers Tab ----
     with tab4:
         st.subheader("Worker Management")
-        sections_df = read_table("Sections")
-        departments_df = read_table("Departments")
-        shifts_df = read_table("Shifts")
-        workers_df = read_table("Workers")
+        sections_df = read_table("sections")
+        departments_df = read_table("departments")
+        shifts_df = read_table("shifts")
+        workers_df = read_table("workers")
         
         # Ensure required columns exist
         if 'Active' not in workers_df.columns:
@@ -638,7 +671,7 @@ def admin_dashboard():
                         st.error("Excel must contain columns: Name, Section, Department, Shift")
                     else:
                         # load current workers
-                        workers_df = read_table("Workers")
+                        workers_df = read_table("workers")
                         if workers_df.empty:
                             workers_df = pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active'])
                         # Ensure required columns exist
@@ -667,7 +700,7 @@ def admin_dashboard():
                         else:
                             add_df = pd.DataFrame(new_rows)
                             workers_df = pd.concat([workers_df, add_df], ignore_index=True)
-                            if write_table("Workers", workers_df):
+                            if write_table("workers", workers_df):
                                 st.success(f"Added {len(add_df)} new workers")
                                 st.rerun()
                 except Exception as e:
@@ -690,7 +723,7 @@ def admin_dashboard():
                 
                 if st.form_submit_button("Add Worker"):
                     if w_name and w_section and w_department and w_shift:
-                        workers_df = read_table("Workers")
+                        workers_df = read_table("workers")
                         # Ensure required columns exist
                         if 'Active' not in workers_df.columns:
                             workers_df['Active'] = True
@@ -703,7 +736,7 @@ def admin_dashboard():
                         new_id = int(workers_df['ID'].max())+1 if not workers_df.empty and 'ID' in workers_df.columns else 1
                         new_worker = pd.DataFrame([{'ID':new_id,'Name':w_name,'Section':w_section,'Department':w_department,'Shift':w_shift,'Active':True}])
                         workers_df = pd.concat([workers_df,new_worker], ignore_index=True)
-                        if write_table("Workers", workers_df):
+                        if write_table("workers", workers_df):
                             st.success("Worker added")
                             st.rerun()
                     else:
@@ -712,7 +745,7 @@ def admin_dashboard():
         # Worker list + export
         with col2:
             st.markdown("#### 📋 All Workers")
-            workers_df = read_table("Workers")
+            workers_df = read_table("workers")
             # Ensure required columns exist
             if 'Active' not in workers_df.columns:
                 workers_df['Active'] = True
@@ -734,7 +767,7 @@ def admin_dashboard():
                     colA, colB = st.columns([3,1])
                     with colA:
                         if st.button("Deactivate" if str(w['Active']).lower() in ['true','1','yes'] else "Activate", key=f"toggle_worker_{w['ID']}"):
-                            df = read_table("Workers")
+                            df = read_table("workers")
                             # Ensure required columns exist
                             if 'Active' not in df.columns:
                                 df['Active'] = True
@@ -745,7 +778,7 @@ def admin_dashboard():
                             if 'Shift' not in df.columns:
                                 df['Shift'] = ''
                             df.loc[df['ID'] == w['ID'], 'Active'] = not (str(w['Active']).lower() in ['true','1','yes'])
-                            write_table("Workers", df)
+                            write_table("workers", df)
                             st.rerun()
                     with colB:
                         # Worker ID display
@@ -756,7 +789,7 @@ def admin_dashboard():
     # ---- Attendance Tab (Admin view) ----
     with tab5:
         st.subheader("📊 Attendance Records")
-        att = read_table("Attendance")
+        att = read_table("attendance")
         if not att.empty:
             # Check if 'Date' column exists
             if 'Date' in att.columns:
@@ -792,16 +825,16 @@ def admin_dashboard():
     with tab6:
         st.subheader("Danger Zone - Delete Data")
         if st.button("Clear All Attendance", key="clear_attendance"):
-            write_table("Attendance", pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp']))
+            write_table("attendance", pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp']))
             st.success("Attendance cleared")
         if st.button("Clear All Workers", key="clear_workers"):
-            write_table("Workers", pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active']))
+            write_table("workers", pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active']))
             st.success("Workers cleared")
         if st.button("Clear All Departments", key="clear_departments"):
-            write_table("Departments", pd.DataFrame(columns=['ID','Name','Section_ID','Description']))
+            write_table("departments", pd.DataFrame(columns=['ID','Name','Section_ID','Description']))
             st.success("Departments cleared")
         if st.button("Clear All Sections", key="clear_sections"):
-            write_table("Sections", pd.DataFrame(columns=['ID','Name','Description']))
+            write_table("sections", pd.DataFrame(columns=['ID','Name','Description']))
             st.success("Sections cleared")
 
 # ==================== SUPERVISOR DASHBOARD ====================
@@ -809,10 +842,10 @@ def supervisor_dashboard():
     st.title("👷 Supervisor Dashboard")
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["✅ Mark Attendance", "📊 Attendance Register", "🔄 Transfer Workers", "👥 Manage Workers", "📅 View Attendance", "📊 Attendance Grid"])
 
-    sections_df = read_table("Sections")
-    departments_df = read_table("Departments")
-    shifts_df = read_table("Shifts")
-    workers_df = read_table("Workers")
+    sections_df = read_table("sections")
+    departments_df = read_table("departments")
+    shifts_df = read_table("shifts")
+    workers_df = read_table("workers")
     
     # Ensure required columns exist in Workers DataFrame
     if 'Active' not in workers_df.columns:
@@ -848,7 +881,7 @@ def supervisor_dashboard():
             selected_shift = st.selectbox("Select Shift", ["All"] + (shifts_df['Name'].tolist() if not shifts_df.empty else []), key="mark_shift")
 
         # Filter workers based on selection
-        wdf = read_table("Workers")
+        wdf = read_table("workers")
         # Ensure required columns exist
         if 'Active' not in wdf.columns:
             wdf['Active'] = True
@@ -876,7 +909,7 @@ def supervisor_dashboard():
             st.write(f"### 📋 Mark Attendance for {mark_date.strftime('%B %d, %Y')} ({len(filtered)} workers)")
             
             # Check if attendance already exists for this date and workers
-            att_df = read_table("Attendance")
+            att_df = read_table("attendance")
             
             # Only process if 'Date' column exists
             if not att_df.empty and 'Date' in att_df.columns:
@@ -968,7 +1001,7 @@ def supervisor_dashboard():
                         new_att = pd.DataFrame(new_records)
                         att_df = pd.concat([att_df, new_att], ignore_index=True)
                     
-                    if write_table("Attendance", att_df):
+                    if write_table("attendance", att_df):
                         st.success(f"Updated attendance for {len(filtered)} workers")
                         st.rerun()
 
@@ -996,7 +1029,7 @@ def supervisor_dashboard():
             reg_shift = st.selectbox("Select Shift", ["All"] + (shifts_df['Name'].tolist() if not shifts_df.empty else []), key="reg_shift")
         
         # Get attendance data
-        att = read_table("Attendance")
+        att = read_table("attendance")
         if not att.empty:
             # Check if 'Date' column exists
             if 'Date' in att.columns:
@@ -1073,7 +1106,7 @@ def supervisor_dashboard():
                             
                             if st.form_submit_button("Save Changes"):
                                 # Update the attendance records
-                                att_df = read_table("Attendance")
+                                att_df = read_table("attendance")
                                 
                                 for idx, record in records_to_edit.iterrows():
                                     worker_name = record['Worker_Name']
@@ -1088,7 +1121,7 @@ def supervisor_dashboard():
                                         att_df.loc[att_df['ID'] == record_id, 'Timestamp'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                                 
                                 # Save the updated dataframe
-                                if write_table("Attendance", att_df):
+                                if write_table("attendance", att_df):
                                     st.success("Attendance records updated successfully!")
                                     st.rerun()
                     
@@ -1117,7 +1150,7 @@ def supervisor_dashboard():
     # ---------- TAB 3: Transfer Workers ----------
     with tab3:
         st.subheader("🔄 Transfer Workers")
-        wdf = read_table("Workers")
+        wdf = read_table("workers")
         # Ensure required columns exist
         if 'Active' not in wdf.columns:
             wdf['Active'] = True
@@ -1157,7 +1190,7 @@ def supervisor_dashboard():
                     wdf.loc[wdf['ID']==row['ID'],'Section'] = new_section
                     wdf.loc[wdf['ID']==row['ID'],'Department'] = new_department
                     wdf.loc[wdf['ID']==row['ID'],'Shift'] = new_shift
-                    write_table("Workers", wdf)
+                    write_table("workers", wdf)
                     st.success("Transferred")
             else:
                 st.info("No active workers")
@@ -1167,7 +1200,7 @@ def supervisor_dashboard():
     # ---------- TAB 4: Manage Workers ----------
     with tab4:
         st.subheader("👥 Manage Workers")
-        wdf = read_table("Workers")
+        wdf = read_table("workers")
         # Ensure required columns exist
         if 'Active' not in wdf.columns:
             wdf['Active'] = True
@@ -1186,7 +1219,7 @@ def supervisor_dashboard():
                     with col1:
                         if str(w['Active']).lower() in ['true','1','yes']:
                             if st.button("Deactivate", key=f"sup_deact_{w['ID']}"):
-                                df = read_table("Workers")
+                                df = read_table("workers")
                                 # Ensure required columns exist
                                 if 'Active' not in df.columns:
                                     df['Active'] = True
@@ -1197,11 +1230,11 @@ def supervisor_dashboard():
                                 if 'Shift' not in df.columns:
                                     df['Shift'] = ''
                                 df.loc[df['ID']==w['ID'],'Active'] = False
-                                write_table("Workers", df)
+                                write_table("workers", df)
                                 st.rerun()
                         else:
                             if st.button("Activate", key=f"sup_act_{w['ID']}"):
-                                df = read_table("Workers")
+                                df = read_table("workers")
                                 # Ensure required columns exist
                                 if 'Active' not in df.columns:
                                     df['Active'] = True
@@ -1212,13 +1245,13 @@ def supervisor_dashboard():
                                 if 'Shift' not in df.columns:
                                     df['Shift'] = ''
                                 df.loc[df['ID']==w['ID'],'Active'] = True
-                                write_table("Workers", df)
+                                write_table("workers", df)
                                 st.rerun()
                     with col2:
                         if st.button("🗑️ Delete", key=f"sup_del_{w['ID']}"):
-                            df = read_table("Workers")
+                            df = read_table("workers")
                             df = df[df['ID'] != w['ID']]
-                            write_table("Workers", df)
+                            write_table("workers", df)
                             st.rerun()
         else:
             st.info("No workers found")
@@ -1226,7 +1259,7 @@ def supervisor_dashboard():
     # ---------- TAB 5: View Attendance ----------
     with tab5:
         st.subheader("📅 View Attendance")
-        att = read_table("Attendance")
+        att = read_table("attendance")
         if not att.empty:
             # Check if 'Date' column exists
             if 'Date' in att.columns:
@@ -1324,10 +1357,10 @@ def supervisor_dashboard():
 def hr_dashboard():
     st.title("📊 HR Dashboard")
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Daily","📅 Monthly","👥 Directory", "📊 Attendance Grid"])
-    sections_df = read_table("Sections")
-    departments_df = read_table("Departments")
-    workers_df = read_table("Workers")
-    attendance_df = read_table("Attendance")
+    sections_df = read_table("sections")
+    departments_df = read_table("departments")
+    workers_df = read_table("workers")
+    attendance_df = read_table("attendance")
     
     # Ensure required columns exist in Workers DataFrame
     if 'Active' not in workers_df.columns:
