@@ -87,7 +87,7 @@ def write_table(table_name, df):
     
     try:
         # Replace the entire table content
-        df.to_sql(table_name, engine, if_exists='replace', index=False, schema='public')
+        df.to_sql(table_name, engine, if_exists='replace', index=False, schema='attendance')
         return True
     except Exception as e:
         st.error(f"Error writing to table {table_name}: {e}")
