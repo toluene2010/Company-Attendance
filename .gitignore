@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Environment variables
+.env
+.streamlit/secrets.toml
+New Text Document (2).txt
+New Text Document.txt
+employee.xlsx
