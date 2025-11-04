@@ -1,63 +1,49 @@
 import streamlit as st
 import pandas as pd
 import datetime
-from io import StringIO, BytesIO
-import time
-import base64
 import os
-import json
-import calendar
-from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, Boolean, Date, DateTime, ForeignKey
-import psycopg2
+import bcrypt
+from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, Boolean, Date, DateTime
 
 # ==================== CONFIGURATION ====================
-# PostgreSQL connection details
 try:
-    # Try to get from Streamlit secrets first (production)
     DB_USER = st.secrets["database"]["DB_USER"]
     DB_PASSWORD = st.secrets["database"]["DB_PASSWORD"]
     DB_HOST = st.secrets["database"]["DB_HOST"]
     DB_PORT = st.secrets["database"]["DB_PORT"]
     DB_NAME = st.secrets["database"]["DB_NAME"]
 except Exception:
-    # Fallback to environment variables (local dev)
     DB_USER = os.getenv("DB_USER", "Company_Attendance_subjectlet")
     DB_PASSWORD = os.getenv("DB_PASSWORD", "your_local_password_here")
     DB_HOST = os.getenv("DB_HOST", "localhost")
     DB_PORT = os.getenv("DB_PORT", "5432")
     DB_NAME = os.getenv("DB_NAME", "Company_Attendance_subjectlet")
 
-# Create database connection URL with schema
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # ==================== DATABASE CONNECTION ====================
 @st.cache_resource
 def get_db_connection():
-    """Create a database connection"""
     try:
         engine = create_engine(DATABASE_URL)
+        # Ensure schema exists
+        with engine.connect() as conn:
+            conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS attendance AUTHORIZATION {DB_USER}"))
+            conn.commit()
         return engine
     except Exception as e:
         st.error(f"Error connecting to database: {e}")
         return None
 
 def execute_query(query, params=None):
-    """Execute a SQL query and return results"""
     engine = get_db_connection()
     if engine is None:
         return None
-    
     try:
         with engine.connect() as conn:
-            if params:
-                result = conn.execute(text(query), params)
-            else:
-                result = conn.execute(text(query))
-            
-            # For SELECT queries, fetch all results
+            result = conn.execute(text(query), params or {})
             if query.strip().upper().startswith("SELECT"):
                 return result.fetchall()
-            # For other queries, commit and return success
             else:
                 conn.commit()
                 return True
@@ -66,13 +52,11 @@ def execute_query(query, params=None):
         return None
 
 def read_table(table_name):
-    """Read data from a table and return as DataFrame"""
     engine = get_db_connection()
     if engine is None:
         return pd.DataFrame()
-    
     try:
-        query = f"SELECT * FROM public.{table_name}"
+        query = f"SELECT * FROM attendance.{table_name}"   # 👈 fixed schema
         df = pd.read_sql(query, engine)
         return df
     except Exception as e:
@@ -80,13 +64,10 @@ def read_table(table_name):
         return pd.DataFrame()
 
 def write_table(table_name, df):
-    """Write DataFrame to table, replacing existing data"""
     engine = get_db_connection()
     if engine is None:
         return False
-    
     try:
-        # Replace the entire table content
         df.to_sql(table_name, engine, if_exists='replace', index=False, schema='attendance')
         return True
     except Exception as e:
@@ -94,11 +75,9 @@ def write_table(table_name, df):
         return False
 
 def table_exists(table_name):
-    """Check if a table exists in the database"""
     engine = get_db_connection()
     if engine is None:
         return False
-    
     try:
         with engine.connect() as conn:
             query = text("""
@@ -116,23 +95,20 @@ def table_exists(table_name):
 
 # ==================== INITIALIZATION ====================
 def initialize_system():
-    """Create tables if they don't exist"""
     engine = get_db_connection()
     if engine is None:
         st.error("Cannot connect to database. System initialization failed.")
         return
     
-    # Create tables if they don't exist
     metadata = MetaData()
-    
-    # Define tables
+
+    # Define tables in attendance schema
     shifts = Table(
         'shifts', metadata,
         Column('ID', Integer, primary_key=True),
         Column('Name', String(255), nullable=False),
         schema='attendance'
     )
-    
     sections = Table(
         'sections', metadata,
         Column('ID', Integer, primary_key=True),
@@ -140,7 +116,6 @@ def initialize_system():
         Column('Description', String(500)),
         schema='attendance'
     )
-    
     departments = Table(
         'departments', metadata,
         Column('ID', Integer, primary_key=True),
@@ -149,7 +124,6 @@ def initialize_system():
         Column('Description', String(500)),
         schema='attendance'
     )
-    
     users = Table(
         'users', metadata,
         Column('ID', Integer, primary_key=True),
@@ -162,7 +136,6 @@ def initialize_system():
         Column('Assigned_Shift', String(255)),
         schema='attendance'
     )
-    
     workers = Table(
         'workers', metadata,
         Column('ID', Integer, primary_key=True),
@@ -173,7 +146,6 @@ def initialize_system():
         Column('Active', Boolean, default=True),
         schema='attendance'
     )
-    
     attendance = Table(
         'attendance', metadata,
         Column('ID', Integer, primary_key=True),
@@ -187,69 +159,80 @@ def initialize_system():
         Column('Timestamp', DateTime, default=datetime.datetime.now),
         schema='attendance'
     )
-    
-    # Create tables in the database
+
     try:
         metadata.create_all(engine)
         st.success("Database tables created successfully!")
     except Exception as e:
         st.error(f"Error creating database tables: {e}")
         return
-    
-    # Check if tables have data and insert default data if empty
-    # Shifts
-    shifts_df = read_table("shifts")
-    if shifts_df.empty:
-        shifts_df = pd.DataFrame({'ID':[1,2,3],'Name':['Morning','Afternoon','General']})
-        write_table("shifts", shifts_df)
-    
-    # Sections
-    sections_df = read_table("sections")
-    if sections_df.empty:
-        sections_df = pd.DataFrame({
+
+    # Insert default data if empty
+    if read_table("shifts").empty:
+        write_table("shifts", pd.DataFrame({'ID':[1,2,3],'Name':['Morning','Afternoon','General']}))
+    if read_table("sections").empty:
+        write_table("sections", pd.DataFrame({
             'ID': [1, 2, 3],
             'Name': ['Liquid Section', 'Solid Section', 'Utility Section'],
             'Description': ['Liquid manufacturing', 'Solid manufacturing', 'Utility services']
-        })
-        write_table("sections", sections_df)
-    
-    # Departments
-    departments_df = read_table("departments")
-    if departments_df.empty:
-        departments_df = pd.DataFrame({
+        }))
+    if read_table("departments").empty:
+        write_table("departments", pd.DataFrame({
             'ID': [1, 2, 3, 4],
             'Name': ['Mixing', 'Filling', 'Packaging', 'Maintenance'],
             'Section_ID': [1, 1, 2, 3],
             'Description': ['Mixing department', 'Filling department', 'Packaging department', 'Maintenance department']
-        })
-        write_table("departments", departments_df)
-    
-    # Users
-    users_df = read_table("users")
-    if users_df.empty:
+        }))
+    if read_table("users").empty:
+        # Hash the admin password
+        hashed_password = bcrypt.hashpw("admin123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
         users_df = pd.DataFrame([{
             'ID': 1,
             'Name': 'Admin User',
             'Username': 'admin',
-            'Password': 'admin123',
+            'Password': hashed_password,
             'Role': 'Admin',
             'Active': True,
             'Assigned_Section': '',
             'Assigned_Shift': ''
         }])
         write_table("users", users_df)
+    if read_table("workers").empty:
+        write_table("workers", pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active']))
+    if read_table("attendance").empty:
+        write_table("attendance", pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp']))
+
+# ==================== AUTHENTICATION ====================
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Check a plain password against the stored bcrypt hash"""
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+
+def login(username: str, password: str) -> bool:
+    """Verify user login credentials against the database"""
+    engine = get_db_connection()
+    if engine is None:
+        return False
     
-    # Workers
-    workers_df = read_table("workers")
-    if workers_df.empty:
-        workers_df = pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active'])
-        write_table("workers", workers_df)
-    
-    # Attendance
-    attendance_df = read_table("attendance")
-    if attendance_df.empty:
-        attendance_df = pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp'])
-        write_table("attendance", attendance_df)
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT Password, Role, Active FROM attendance.users WHERE Username = :u"),
+            {"u": username}
+        ).fetchone()
+        
+        if result:
+            stored_hash, role, active = result
+            if active and verify_password(password, stored_hash):
+                st.session_state["logged_in"] = True
+                st.session_state["username"] = username
+                st.session_state["role"] = role
+                return True
+    return False
+
+def logout():
+    """Clear session state on logout"""
+    st.session_state.clear()
+
 
 # ==================== MOBILE RESPONSIVENESS ====================
 def mobile_responsive_css():
