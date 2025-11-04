@@ -1,4 +1,3 @@
-```python
 # App.py — Company Attendance System (secure, schema-aware, role-based)
 
 import streamlit as st
@@ -620,4 +619,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
