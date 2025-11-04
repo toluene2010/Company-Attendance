@@ -104,7 +104,7 @@ def table_exists(table_name):
             query = text("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
+                    WHERE table_schema = 'attendance' 
                     AND table_name = :table_name
                 )
             """)
@@ -130,7 +130,7 @@ def initialize_system():
         'shifts', metadata,
         Column('ID', Integer, primary_key=True),
         Column('Name', String(255), nullable=False),
-        schema='public'
+        schema='attendance'
     )
     
     sections = Table(
@@ -138,7 +138,7 @@ def initialize_system():
         Column('ID', Integer, primary_key=True),
         Column('Name', String(255), nullable=False),
         Column('Description', String(500)),
-        schema='public'
+        schema='attendance'
     )
     
     departments = Table(
@@ -147,7 +147,7 @@ def initialize_system():
         Column('Name', String(255), nullable=False),
         Column('Section_ID', Integer),
         Column('Description', String(500)),
-        schema='public'
+        schema='attendance'
     )
     
     users = Table(
@@ -160,7 +160,7 @@ def initialize_system():
         Column('Active', Boolean, default=True),
         Column('Assigned_Section', String(255)),
         Column('Assigned_Shift', String(255)),
-        schema='public'
+        schema='attendance'
     )
     
     workers = Table(
@@ -171,7 +171,7 @@ def initialize_system():
         Column('Department', String(255)),
         Column('Shift', String(255)),
         Column('Active', Boolean, default=True),
-        schema='public'
+        schema='attendance'
     )
     
     attendance = Table(
@@ -185,7 +185,7 @@ def initialize_system():
         Column('Shift', String(255)),
         Column('Status', String(50), nullable=False),
         Column('Timestamp', DateTime, default=datetime.datetime.now),
-        schema='public'
+        schema='attendance'
     )
     
     # Create tables in the database
