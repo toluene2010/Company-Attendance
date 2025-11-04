@@ -18,11 +18,9 @@ try:
     DB_NAME = st.secrets["database"]["DB_NAME"]
 except Exception:
     # Use your actual credentials
-    DB_USER = "Company_Attendance_subjectlet"
-    DB_PASSWORD = "your_actual_password_here"  # Replace with your actual password
-    DB_HOST = "2m8iu9.h.filess.io"
-    DB_PORT = "5434"
-    DB_NAME = "Company_Attendance_subjectlet"
+    st.error("❌ Database configuration not found in secrets")
+    st.error("Please configure your database credentials in Streamlit secrets")
+    st.stop()
 
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
