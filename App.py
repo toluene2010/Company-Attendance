@@ -26,9 +26,9 @@ DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NA
 def get_db_connection():
     try:
         engine = create_engine(DATABASE_URL)
-        # Ensure schema exists
         with engine.connect() as conn:
-            conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS attendance AUTHORIZATION {DB_USER}"))
+            # Simpler: don’t force AUTHORIZATION
+            conn.execute(text("CREATE SCHEMA IF NOT EXISTS attendance"))
             conn.commit()
         return engine
     except Exception as e:
