@@ -1,7 +1,6 @@
-# ==========================================================
-# Company Attendance System (Full) — Public schema, Hybrid DB,
-# auto-init + self-heal, admin seeding, dashboards intact.
-# ==========================================================
+# App.py
+# Company Attendance System — Stabilized with Audit Trail
+# Replace your existing App.py with this file.
 
 import streamlit as st
 import pandas as pd
@@ -17,7 +16,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 # --------------------- CONFIG -----------------------------
-
 st.set_page_config(page_title="Attendance", page_icon="🗂️", layout="wide")
 
 SQLITE_URL = "sqlite:///attendance_offline.db"
@@ -71,7 +69,6 @@ def current_engine():
 
 # ----------------- TABLE DEFINITIONS ----------------------
 
-# Postgres-compatible schema
 PG_TABLES = [
     """CREATE TABLE IF NOT EXISTS shifts (
         ID SERIAL PRIMARY KEY,
@@ -116,10 +113,17 @@ PG_TABLES = [
         Shift VARCHAR(255),
         Status VARCHAR(50) NOT NULL,
         Timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""",
+    """CREATE TABLE IF NOT EXISTS audit_log (
+        ID SERIAL PRIMARY KEY,
+        Username VARCHAR(255),
+        Role VARCHAR(50),
+        Action VARCHAR(255),
+        Details TEXT,
+        Timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )"""
 ]
 
-# SQLite-compatible schema
 SQLITE_TABLES = [
     """CREATE TABLE IF NOT EXISTS shifts (
         ID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,6 +168,14 @@ SQLITE_TABLES = [
         Shift TEXT,
         Status TEXT NOT NULL,
         Timestamp TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS audit_log (
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Username TEXT,
+        Role TEXT,
+        Action TEXT,
+        Details TEXT,
+        Timestamp TEXT DEFAULT (datetime('now'))
     )"""
 ]
 
@@ -184,52 +196,86 @@ def initialize_databases():
 def seed_defaults():
     eng = current_engine()
     with eng.begin() as conn:
-        # shifts
-        c = conn.execute(text("SELECT COUNT(*) FROM shifts")).scalar()
-        if c == 0:
-            conn.execute(text("INSERT INTO shifts (Name) VALUES ('Morning'), ('Afternoon'), ('General')"))
-        # sections
-        c = conn.execute(text("SELECT COUNT(*) FROM sections")).scalar()
-        if c == 0:
-            conn.execute(text("""
-                INSERT INTO sections (Name, Description) VALUES
-                ('Liquid Section','Liquid manufacturing'),
-                ('Solid Section','Solid manufacturing'),
-                ('Utility Section','Utility services')
-            """))
-        # departments
-        c = conn.execute(text("SELECT COUNT(*) FROM departments")).scalar()
-        if c == 0:
-            conn.execute(text("""
-                INSERT INTO departments (Name, Section_ID, Description) VALUES
-                ('Mixing', 1, 'Mixing department'),
-                ('Filling', 1, 'Filling department'),
-                ('Packaging', 2, 'Packaging department'),
-                ('Maintenance', 3, 'Maintenance department')
-            """))
-        # users
-        c = conn.execute(text("SELECT COUNT(*) FROM users")).scalar()
-        if c == 0:
-            hashed = bcrypt.hashpw("admin123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-            conn.execute(
-                text("""INSERT INTO users (Name, Username, Password, Role, Active, Assigned_Section, Assigned_Shift)
-                        VALUES (:n, :u, :p, :r, :a, :s, :sh)"""),
-                {"n":"Admin User","u":"admin","p":hashed,"r":"Admin","a":True,"s":"","sh":""}
-            )
+        try:
+            # shifts
+            try:
+                c = conn.execute(text("SELECT COUNT(*) FROM shifts")).scalar()
+                if c == 0:
+                    conn.execute(text("INSERT INTO shifts (Name) VALUES ('Morning'), ('Afternoon'), ('General')"))
+            except Exception:
+                pass
+            # sections
+            try:
+                c = conn.execute(text("SELECT COUNT(*) FROM sections")).scalar()
+                if c == 0:
+                    conn.execute(text("""
+                        INSERT INTO sections (Name, Description) VALUES
+                        ('Liquid Section','Liquid manufacturing'),
+                        ('Solid Section','Solid manufacturing'),
+                        ('Utility Section','Utility services')
+                    """))
+            except Exception:
+                pass
+            # departments
+            try:
+                c = conn.execute(text("SELECT COUNT(*) FROM departments")).scalar()
+                if c == 0:
+                    conn.execute(text("""
+                        INSERT INTO departments (Name, Section_ID, Description) VALUES
+                        ('Mixing', 1, 'Mixing department'),
+                        ('Filling', 1, 'Filling department'),
+                        ('Packaging', 2, 'Packaging department'),
+                        ('Maintenance', 3, 'Maintenance department')
+                    """))
+            except Exception:
+                pass
+            # users
+            try:
+                c = conn.execute(text("SELECT COUNT(*) FROM users")).scalar()
+                if c == 0:
+                    hashed = bcrypt.hashpw("admin123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+                    conn.execute(
+                        text("""INSERT INTO users (Name, Username, Password, Role, Active, Assigned_Section, Assigned_Shift)
+                                VALUES (:n, :u, :p, :r, :a, :s, :sh)"""),
+                        {"n":"Admin User","u":"admin","p":hashed,"r":"Admin","a":True,"s":"","sh":""}
+                    )
+            except Exception:
+                pass
+        except Exception as e:
+            st.error(f"Error during seeding: {str(e)}")
 
 # --------------- SELF-HEAL HELPERS -----------------------
 
 def read_table(table):
     eng = current_engine()
     try:
-        return pd.read_sql(f"SELECT * FROM {table}", eng)
-    except Exception:
-        st.warning(f"⚙️ Rebuilding tables... ({table} missing or invalid)")
+        df = pd.read_sql(f"SELECT * FROM {table}", eng)
+        # Provide expected columns and add missing ones silently
+        expected_cols = {
+            "sections": ["ID", "Name", "Description"],
+            "departments": ["ID", "Name", "Section_ID", "Description"],
+            "users": ["ID", "Name", "Username", "Password", "Role", "Active", "Assigned_Section", "Assigned_Shift"],
+            "workers": ["ID", "Name", "Section", "Department", "Shift", "Active"],
+            "attendance": ["ID", "Worker_ID", "Worker_Name", "Date", "Section", "Department", "Shift", "Status", "Timestamp"],
+            "shifts": ["ID", "Name"],
+            "audit_log": ["ID", "Username", "Role", "Action", "Details", "Timestamp"]
+        }.get(table, [])
+
+        for c in expected_cols:
+            if c not in df.columns:
+                # Add missing column with empty/default values
+                df[c] = "" if c != "Active" else True
+
+        return df
+    except Exception as e:
+        # If table missing or other error — create DB and try again once
         try:
             initialize_databases()
             seed_defaults()
+            eng = current_engine()
             return pd.read_sql(f"SELECT * FROM {table}", eng)
-        except Exception:
+        except Exception as e2:
+            st.error(f"Cannot read table '{table}': {e2}")
             return pd.DataFrame()
 
 def write_table_replace(table, df: pd.DataFrame) -> bool:
@@ -244,14 +290,15 @@ def write_table_replace(table, df: pd.DataFrame) -> bool:
 # ----------------- SYNC (Offline→Online) ------------------
 
 def sync_from_sqlite_to_supabase():
-    """Push new workers & attendance from SQLite to Supabase when we come online."""
+    """Push new workers & attendance & audit_log from SQLite to Supabase when we come online."""
     on = get_online_engine_or_none()
     if not on:
-        return 0, 0
+        return 0, 0, 0
 
     off = get_offline_engine()
     new_workers = 0
     new_att = 0
+    new_logs = 0
     try:
         off_workers = pd.read_sql("SELECT Name,Section,Department,Shift,Active FROM workers", off)
         on_workers = pd.read_sql("SELECT Name,Section,Department,Shift,Active FROM workers", on)
@@ -276,11 +323,11 @@ def sync_from_sqlite_to_supabase():
         if not off_att.empty:
             off_att["Date"] = pd.to_datetime(off_att["Date"]).dt.date.astype(str)
             on_att["Date"] = pd.to_datetime(on_att["Date"]).dt.date.astype(str)
-            merged = off_att.merge(on_att, how="left", on=["Worker_Name","Date"], indicator=True)
-            to_add = merged[merged["_merge"] == "left_only"][["Worker_ID","Worker_Name","Date","Section","Department","Shift","Status","Timestamp"]]
-            if not to_add.empty:
+            merged2 = off_att.merge(on_att, how="left", on=["Worker_Name","Date"], indicator=True)
+            to_add2 = merged2[merged2["_merge"] == "left_only"][["Worker_ID","Worker_Name","Date","Section","Department","Shift","Status","Timestamp"]]
+            if not to_add2.empty:
                 with on.begin() as conn:
-                    for _, r in to_add.iterrows():
+                    for _, r in to_add2.iterrows():
                         conn.execute(text("""INSERT INTO attendance
                             (Worker_ID,Worker_Name,Date,Section,Department,Shift,Status,Timestamp)
                             VALUES (:wid,:wn,:dt,:s,:d,:sh,:st,:ts)"""),
@@ -288,11 +335,29 @@ def sync_from_sqlite_to_supabase():
                              "wn":r["Worker_Name"],"dt":r["Date"],"s":r["Section"],
                              "d":r["Department"],"sh":r["Shift"],"st":r["Status"],
                              "ts":r["Timestamp"] if pd.notna(r["Timestamp"]) else datetime.datetime.now()})
-                new_att = len(to_add)
+                new_att = len(to_add2)
+
+        # Audit log sync
+        try:
+            off_log = pd.read_sql("SELECT Username,Role,Action,Details,Timestamp FROM audit_log", off)
+            on_log = pd.read_sql("SELECT Username,Role,Action,Details,Timestamp FROM audit_log", on)
+            merged3 = off_log.merge(on_log, how="left", on=["Username","Action","Timestamp"], indicator=True)
+            to_add3 = merged3[merged3["_merge"] == "left_only"][["Username","Role","Action","Details","Timestamp"]]
+            if not to_add3.empty:
+                with on.begin() as conn:
+                    for _, r in to_add3.iterrows():
+                        conn.execute(text("""INSERT INTO audit_log
+                            (Username,Role,Action,Details,Timestamp)
+                            VALUES (:u,:r,:a,:d,:t)"""),
+                            {"u":r["Username"],"r":r["Role"],"a":r["Action"],"d":r["Details"],"t":r["Timestamp"]})
+                new_logs = len(to_add3)
+        except Exception:
+            pass
+
     except Exception as e:
         st.warning(f"Sync note: {e}")
 
-    return new_workers, new_att
+    return new_workers, new_att, new_logs
 
 # ----------------- UTILITIES ------------------------------
 
@@ -350,6 +415,24 @@ def generate_attendance_grid(year, month):
     g["Present Days"] = pres; g["Attendance %"] = perc
     return g
 
+# ----------------- AUDIT TRAIL ----------------------------
+
+def log_action(action: str, details: str = ""):
+    try:
+        eng = current_engine()
+        username = st.session_state.get("username", "System")
+        role = st.session_state.get("role", "System")
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with eng.begin() as conn:
+            conn.execute(
+                text("""INSERT INTO audit_log (Username, Role, Action, Details, Timestamp)
+                        VALUES (:u, :r, :a, :d, :t)"""),
+                {"u": username, "r": role, "a": action, "d": details, "t": ts}
+            )
+    except Exception:
+        # Do not crash the app for audit logging failures
+        pass
+
 # ----------------- AUTH -------------------------------
 
 def login(username, password) -> bool:
@@ -368,18 +451,26 @@ def login(username, password) -> bool:
         st.session_state["username"]=username
         st.session_state["role"]=role
         st.session_state["user_id"]=uid
+        try:
+            log_action("Login", f"User '{username}' logged in.")
+        except Exception:
+            pass
         return True
     return False
 
 def logout():
+    try:
+        log_action("Logout", f"User '{st.session_state.get('username','')}' logged out.")
+    except Exception:
+        pass
     st.session_state.clear()
 
-# ----------------- ADMIN DASHBOARD ---------------------
+# ----------------- DASHBOARDS ---------------------------
 
 def admin_dashboard():
     st.title("🔧 Admin Dashboard")
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["👥 Users", "🏭 Sections", "🏢 Departments", "👷 Workers", "📊 Attendance", "🗑️ Delete Data"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["👥 Users", "🏭 Sections", "🏢 Departments", "👷 Workers", "📊 Attendance", "🗑️ Delete Data", "🕵️ Audit Trail"]
     )
 
     # ---- Users ----
@@ -414,6 +505,7 @@ def admin_dashboard():
                         df = pd.concat([df, new_user], ignore_index=True)
                         if write_table_replace("users", df):
                             st.success("User added")
+                            log_action("Add User", f"New user '{username}' added.")
                             st.rerun()
                     else:
                         st.error("Please fill all fields")
@@ -448,6 +540,7 @@ def admin_dashboard():
                         new_section = pd.DataFrame([{'ID':new_id,'Name':section_name,'Description':desc}])
                         df = pd.concat([df, new_section], ignore_index=True)
                         if write_table_replace("sections", df):
+                            log_action("Add Section", f"Section '{section_name}' added.")
                             st.success("Section added")
                             st.rerun()
                     else:
@@ -463,34 +556,19 @@ def admin_dashboard():
         sections_df = read_table("sections")
         departments_df = read_table("departments")
 
-        # ✅ Auto-heal missing columns in sections
-        expected_sec_cols = ["ID","Name","Description"]
-        missing_sec = [c for c in expected_sec_cols if c not in sections_df.columns]
-        if missing_sec or sections_df.empty:
-            st.warning("⚙️ Rebuilding sections table (missing columns or empty)")
-            initialize_databases()
-            seed_defaults()
-            sections_df = read_table("sections")
-
-        # ✅ Auto-heal missing columns in departments
-        expected_dept_cols = ["ID","Name","Section_ID","Description"]
-        missing_dept = [c for c in expected_dept_cols if c not in departments_df.columns]
-        if missing_dept:
-            st.warning("⚙️ Rebuilding departments table (missing columns)")
-            initialize_databases()
-            seed_defaults()
-            departments_df = read_table("departments")
+        # Provide safe defaults if missing
+        if sections_df.empty or 'ID' not in sections_df.columns:
+            sections_df = pd.DataFrame(columns=['ID','Name','Description'])
+        if departments_df.empty or 'ID' not in departments_df.columns:
+            departments_df = pd.DataFrame(columns=['ID','Name','Section_ID','Description'])
 
         col1, col2 = st.columns([2,3])
         with col1:
             st.markdown("#### ➕ Add Department")
             with st.form("add_department"):
                 dept_name = st.text_input("Department Name")
-                section_id = st.selectbox(
-                    "Section",
-                    sections_df['ID'].tolist() if "ID" in sections_df.columns and not sections_df.empty else [],
-                    key="dept_section"
-                )
+                section_ids = sections_df['ID'].tolist() if 'ID' in sections_df.columns else []
+                section_id = st.selectbox("Section", section_ids, key="dept_section")
                 desc = st.text_area("Description")
                 if st.form_submit_button("Add Department"):
                     if dept_name and section_id:
@@ -504,46 +582,25 @@ def admin_dashboard():
                         }])
                         df = pd.concat([df, new_department], ignore_index=True)
                         if write_table_replace("departments", df):
+                            log_action("Add Department", f"Department '{dept_name}' added.")
                             st.success("Department added")
                             st.rerun()
                     else:
                         st.error("Enter department name and select section")
-        
+
         with col2:
             if not departments_df.empty:
-                # Check if departments_df has required columns before displaying
-                expected_dept_cols = ['ID', 'Name', 'Section_ID', 'Description']
-                missing_dept_cols = [col for col in expected_dept_cols if col not in departments_df.columns]
-                
-                if missing_dept_cols:
-                    st.warning(f"⚠️ Departments table missing columns: {', '.join(missing_dept_cols)}")
-                    st.info("Rebuilding departments table with proper structure...")
-                    initialize_databases()
-                    seed_defaults()
-                    departments_df = read_table("departments")
-                
-                # Check if sections_df has required columns before merging
-                if not sections_df.empty and all(col in sections_df.columns for col in ['ID', 'Name']):
+                if not sections_df.empty and all(col in sections_df.columns for col in ['ID','Name']):
                     merged = departments_df.merge(
                         sections_df[['ID','Name']], left_on='Section_ID', right_on='ID', how='left', suffixes=('', '_section')
                     )
                     merged = merged.rename(columns={'Name':'Department','Name_section':'Section'})
-                    merged = merged.drop(columns=['ID_section'])
-                    st.dataframe(merged[['ID','Department','Section','Description']], width='stretch')
+                    # Safely drop helper columns if present
+                    if 'ID_section' in merged.columns:
+                        merged = merged.drop(columns=['ID_section'])
+                    st.dataframe(merged[['ID','Department','Section','Description']].fillna(""), width='stretch')
                 else:
-                    # If sections data is not available, just show departments without section names
-                    if all(col in departments_df.columns for col in ['ID','Name','Section_ID','Description']):
-                        st.dataframe(departments_df[['ID','Name','Section_ID','Description']], width='stretch')
-                    else:
-                        # Show whatever columns are available
-                        available_cols = [col for col in departments_df.columns if col in expected_dept_cols]
-                        if available_cols:
-                            st.dataframe(departments_df[available_cols], width='stretch')
-                        else:
-                            st.dataframe(departments_df, width='stretch')
-                    
-                    if sections_df.empty:
-                        st.warning("No sections found - section names will not be displayed")
+                    st.dataframe(departments_df.fillna(""), width='stretch')
             else:
                 st.info("No departments found")
 
@@ -610,6 +667,7 @@ def admin_dashboard():
                             add_df = pd.DataFrame(new_rows)
                             wdf = pd.concat([wdf, add_df], ignore_index=True)
                             if write_table_replace("workers", wdf):
+                                log_action("Bulk Upload", f"{len(add_df)} workers uploaded.")
                                 st.success(f"Added {len(add_df)} new workers")
                                 st.rerun()
                 except Exception as e:
@@ -618,14 +676,13 @@ def admin_dashboard():
             st.markdown("#### ➕ Add Single Worker (Admin)")
             with st.form("add_worker_admin"):
                 w_name = st.text_input("Name")
-                w_section = st.selectbox("Section", sections_df['Name'].tolist() if not sections_df.empty else [], key="admin_add_section")
-
+                section_names = sections_df['Name'].tolist() if 'Name' in sections_df.columns else []
+                w_section = st.selectbox("Section", section_names, key="admin_add_section")
                 if w_section and not sections_df.empty and 'Name' in sections_df.columns and 'ID' in sections_df.columns:
                     section_id = sections_df[sections_df['Name'] == w_section]['ID'].values[0]
                     dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
                 else:
                     dept_options = []
-
                 w_department = st.selectbox("Department", dept_options, key="admin_add_department")
                 w_shift = st.selectbox("Shift", shifts_df['Name'].tolist() if not shifts_df.empty else [], key="admin_add_shift")
 
@@ -642,6 +699,7 @@ def admin_dashboard():
                         }])
                         wdf = pd.concat([wdf, new_worker], ignore_index=True)
                         if write_table_replace("workers", wdf):
+                            log_action("Add Worker", f"Worker '{w_name}' added to {w_section}/{w_department}.")
                             st.success("Worker added")
                             st.rerun()
                     else:
@@ -650,10 +708,11 @@ def admin_dashboard():
         with col2:
             st.markdown("#### 📋 All Workers")
             wdf = read_table("workers")
-            for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
+            for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")] :
                 if c not in wdf.columns:
                     wdf[c] = default
-            wdf['Active'] = wdf['Active'].astype(str)
+            if 'Active' in wdf.columns:
+                wdf['Active'] = wdf['Active'].astype(str)
             st.write(f"**Total: {len(wdf)} workers**")
             st.download_button(
                 "📥 Download Workers Excel",
@@ -662,53 +721,62 @@ def admin_dashboard():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
             st.markdown("---")
-            for _, w in wdf.iterrows():
-                tag = '✅' if w['Active'].lower() in ['true','1','yes'] else '❌'
-                with st.expander(f"{tag} {w['Name']} - {w['Section']} / {w['Department']} ({w['Shift']})"):
-                    st.write(f"ID: {w['ID']}")
-                    colA, colB, colC = st.columns([2,1,1])
-                    with colA:
-                        if w['Active'].lower() in ['true','1','yes']:
-                            if st.button("Deactivate", key=f"deact_{w['ID']}"):
+            if not wdf.empty:
+                for _, w in wdf.iterrows():
+                    tag = '✅' if w.get('Active', 'true').lower() in ['true','1','yes'] else '❌'
+                    with st.expander(f"{tag} {w.get('Name','')} - {w.get('Section','')} / {w.get('Department','')} ({w.get('Shift','')})"):
+                        st.write(f"ID: {w.get('ID','')}")
+                        colA, colB, colC = st.columns([2,1,1])
+                        with colA:
+                            if str(w.get('Active','true')).lower() in ['true','1','yes']:
+                                if st.button("Deactivate", key=f"deact_{w.get('ID','')}"):
+                                    df = read_table("workers")
+                                    for c2, default2 in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
+                                        if c2 not in df.columns: df[c2] = default2
+                                    df.loc[df['ID']==w['ID'],'Active'] = False
+                                    write_table_replace("workers", df); log_action("Deactivate Worker", f"Deactivated worker ID {w['ID']}"); st.rerun()
+                            else:
+                                if st.button("Activate", key=f"act_{w.get('ID','')}"):
+                                    df = read_table("workers")
+                                    for c2, default2 in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
+                                        if c2 not in df.columns: df[c2] = default2
+                                    df.loc[df['ID']==w['ID'],'Active'] = True
+                                    write_table_replace("workers", df); log_action("Activate Worker", f"Activated worker ID {w['ID']}"); st.rerun()
+                        with colC:
+                            if st.button("🗑️ Delete", key=f"del_worker_{w.get('ID','')}"):
                                 df = read_table("workers")
-                                for c2, default2 in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-                                    if c2 not in df.columns: df[c2] = default2
-                                df.loc[df['ID']==w['ID'],'Active'] = False
-                                write_table_replace("workers", df); st.rerun()
-                        else:
-                            if st.button("Activate", key=f"act_{w['ID']}"):
-                                df = read_table("workers")
-                                for c2, default2 in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-                                    if c2 not in df.columns: df[c2] = default2
-                                df.loc[df['ID']==w['ID'],'Active'] = True
-                                write_table_replace("workers", df); st.rerun()
-                    with colC:
-                        if st.button("🗑️ Delete", key=f"del_worker_{w['ID']}"):
-                            df = read_table("workers")
-                            df = df[df['ID'] != w['ID']]
-                            write_table_replace("workers", df); st.rerun()
+                                df = df[df['ID'] != w['ID']]
+                                write_table_replace("workers", df); log_action("Delete Worker", f"Deleted worker ID {w['ID']}"); st.rerun()
+            else:
+                st.info("No workers found")
 
     # ---- Attendance (Admin view) ----
     with tab5:
         st.subheader("📊 Attendance Records")
         att = read_table("attendance")
-        if not att.empty and 'Date' in att.columns:
-            att['Date'] = pd.to_datetime(att['Date']).dt.date
+        if att.empty:
+            st.info("No attendance data yet.")
+        else:
+            if 'Date' not in att.columns:
+                att['Date'] = None
+            else:
+                att['Date'] = pd.to_datetime(att['Date']).dt.date
             view_date = st.date_input("Select Date", datetime.date.today(), key="admin_view_date")
-            filtered = att[att['Date'] == view_date]
+            filtered = att[att['Date'] == view_date] if 'Date' in att.columns else pd.DataFrame()
             if not filtered.empty:
                 st.write(f"Attendance for {view_date.strftime('%B %d, %Y')}")
-                st.dataframe(filtered[['Worker_Name','Section','Department','Shift','Status','Timestamp']], width='stretch')
+                cols = [c for c in ['Worker_Name','Section','Department','Shift','Status','Timestamp'] if c in filtered.columns]
+                st.dataframe(filtered[cols], width='stretch')
                 total = len(filtered)
-                present = (filtered['Status'] == 'Present').sum()
-                absent = (filtered['Status'] == 'Absent').sum()
-                late = (filtered['Status'] == 'Late').sum()
-                leave = (filtered['Status'] == 'Leave').sum()
+                present = (filtered['Status'] == 'Present').sum() if 'Status' in filtered.columns else 0
+                absent = (filtered['Status'] == 'Absent').sum() if 'Status' in filtered.columns else 0
+                late = (filtered['Status'] == 'Late').sum() if 'Status' in filtered.columns else 0
+                leave = (filtered['Status'] == 'Leave').sum() if 'Status' in filtered.columns else 0
                 c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Present", present, f"{present/total*100:.1f}%")
-                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%")
-                with c3: st.metric("Late", late, f"{late/total*100:.1f}%")
-                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%")
+                with c1: st.metric("Present", present, f"{present/total*100:.1f}%" if total>0 else "0%")
+                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%" if total>0 else "0%")
+                with c3: st.metric("Late", late, f"{late/total*100:.1f}%" if total>0 else "0%")
+                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%" if total>0 else "0%")
                 st.download_button(
                     "📥 Download Attendance CSV",
                     filtered.to_csv(index=False).encode("utf-8"),
@@ -717,26 +785,60 @@ def admin_dashboard():
                 )
             else:
                 st.info("No attendance records for selected date.")
-        else:
-            st.info("No attendance data yet.")
 
     # ---- Delete Data ----
     with tab6:
         st.subheader("Danger Zone - Delete Data")
         if st.button("Clear All Attendance", key="clear_attendance"):
-            write_table_replace("attendance", pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp']))
-            st.success("Attendance cleared")
+            try:
+                df = pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp'])
+                if write_table_replace("attendance", df):
+                    log_action("Data Deletion", "Cleared all attendance records.")
+                    st.success("Attendance cleared")
+            except Exception as e:
+                st.error(f"Failed to clear attendance: {e}")
         if st.button("Clear All Workers", key="clear_workers"):
-            write_table_replace("workers", pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active']))
-            st.success("Workers cleared")
+            try:
+                df = pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active'])
+                if write_table_replace("workers", df):
+                    log_action("Data Deletion", "Cleared all workers.")
+                    st.success("Workers cleared")
+            except Exception as e:
+                st.error(f"Failed to clear workers: {e}")
         if st.button("Clear All Departments", key="clear_departments"):
-            write_table_replace("departments", pd.DataFrame(columns=['ID','Name','Section_ID','Description']))
-            st.success("Departments cleared")
+            try:
+                df = pd.DataFrame(columns=['ID','Name','Section_ID','Description'])
+                if write_table_replace("departments", df):
+                    log_action("Data Deletion", "Cleared all departments.")
+                    st.success("Departments cleared")
+            except Exception as e:
+                st.error(f"Failed to clear departments: {e}")
         if st.button("Clear All Sections", key="clear_sections"):
-            write_table_replace("sections", pd.DataFrame(columns=['ID','Name','Description']))
-            st.success("Sections cleared")
+            try:
+                df = pd.DataFrame(columns=['ID','Name','Description'])
+                if write_table_replace("sections", df):
+                    log_action("Data Deletion", "Cleared all sections.")
+                    st.success("Sections cleared")
+            except Exception as e:
+                st.error(f"Failed to clear sections: {e}")
 
-# ----------------- SUPERVISOR DASHBOARD ------------------
+    # ---- Audit Trail ----
+    with tab7:
+        st.subheader("🕵️ Audit Trail (Activity Log)")
+        logs = read_table("audit_log")
+        if not logs.empty:
+            if 'Timestamp' in logs.columns:
+                logs['Timestamp'] = pd.to_datetime(logs['Timestamp'])
+                logs = logs.sort_values("Timestamp", ascending=False)
+            st.dataframe(logs.fillna(""), width='stretch')
+            st.download_button(
+                "📥 Download Audit Log",
+                logs.to_csv(index=False).encode("utf-8"),
+                file_name="audit_log.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No audit records yet.")
 
 def supervisor_dashboard():
     st.title("👷 Supervisor Dashboard")
@@ -866,6 +968,7 @@ def supervisor_dashboard():
                         att_df = pd.concat([att_df, new_att], ignore_index=True)
 
                     if write_table_replace("attendance", att_df):
+                        log_action("Mark Attendance", f"Marked attendance for {len(filtered)} workers on {mark_date}")
                         st.success(f"Updated attendance for {len(filtered)} workers")
                         st.rerun()
 
@@ -897,20 +1000,13 @@ def supervisor_dashboard():
 
             if not filtered.empty:
                 st.write(f"### Attendance Register for {reg_date.strftime('%B %d, %Y')}")
-                # Check if filtered attendance has required columns before processing
                 expected_att_cols = ['Worker_Name','Section','Department','Shift','Status','Timestamp']
                 missing_att_cols = [col for col in expected_att_cols if col not in filtered.columns]
-                
                 if missing_att_cols:
-                    st.warning(f"⚠️ Attendance table missing columns: {', '.join(missing_att_cols)}")
-                    # Add missing columns with empty values
                     for col in missing_att_cols:
                         filtered[col] = ""
-                
                 editable_df = filtered.copy()
                 editable_df["Edit"] = False
-                
-                # Use only available columns for display
                 display_cols = [col for col in expected_att_cols if col in editable_df.columns]
                 if display_cols:
                     display_cols.append("Edit")
@@ -931,7 +1027,7 @@ def supervisor_dashboard():
                 else:
                     st.info("No attendance data available for editing")
                     edited_df = pd.DataFrame()
-                records_to_edit = edited_df[edited_df["Edit"] == True]
+                records_to_edit = edited_df[edited_df["Edit"] == True] if not edited_df.empty else pd.DataFrame()
                 if not records_to_edit.empty:
                     st.subheader("Edit Selected Records")
                     with st.form("edit_attendance_form"):
@@ -960,6 +1056,7 @@ def supervisor_dashboard():
                                     att_df.loc[att_df["ID"] == record_id, "Status"] = new_status
                                     att_df.loc[att_df["ID"] == record_id, "Timestamp"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             if write_table_replace("attendance", att_df):
+                                log_action("Edit Attendance", f"Edited attendance on {reg_date} for {len(records_to_edit)} record(s).")
                                 st.success("Attendance records updated successfully!")
                                 st.rerun()
 
@@ -1015,6 +1112,7 @@ def supervisor_dashboard():
                     wdf.loc[wdf['ID']==row['ID'],'Department'] = new_department
                     wdf.loc[wdf['ID']==row['ID'],'Shift'] = new_shift
                     write_table_replace("workers", wdf)
+                    log_action("Transfer Worker", f"Transferred worker ID {row['ID']} to {new_section}/{new_department}/{new_shift}")
                     st.success("Transferred")
             else:
                 st.info("No active workers")
@@ -1030,33 +1128,32 @@ def supervisor_dashboard():
                 wdf[c] = default
         if not wdf.empty:
             for _, w in wdf.iterrows():
-                tag = '✅' if str(w['Active']).lower() in ['true','1','yes'] else '❌'
-                with st.expander(f"{tag} {w['Name']} - {w.get('Section','')} / {w.get('Department','')} ({w.get('Shift','')})"):
-                    st.write(f"ID: {w['ID']}")
+                tag = '✅' if str(w.get('Active','true')).lower() in ['true','1','yes'] else '❌'
+                with st.expander(f"{tag} {w.get('Name','')} - {w.get('Section','')} / {w.get('Department','')} ({w.get('Shift','')})"):
+                    st.write(f"ID: {w.get('ID','')}")
                     st.write(f"Section: {w.get('Section','')} | Department: {w.get('Department','')} | Shift: {w.get('Shift','')}")
                     col1, col2 = st.columns([3,1])
                     with col1:
-                        if str(w['Active']).lower() in ['true','1','yes']:
-                            if st.button("Deactivate", key=f"sup_deact_{w['ID']}"):
+                        if str(w.get('Active','true')).lower() in ['true','1','yes']:
+                            if st.button("Deactivate", key=f"sup_deact_{w.get('ID','')}"):
                                 df = read_table("workers")
                                 for c2, default2 in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
                                     if c2 not in df.columns: df[c2] = default2
                                 df.loc[df['ID']==w['ID'],'Active'] = False
-                                write_table_replace("workers", df)
-                                st.rerun()
+                                write_table_replace("workers", df); log_action("Deactivate Worker", f"Deactivated worker ID {w['ID']}"); st.rerun()
                         else:
-                            if st.button("Activate", key=f"sup_act_{w['ID']}"):
+                            if st.button("Activate", key=f"sup_act_{w.get('ID','')}"):
                                 df = read_table("workers")
                                 for c2, default2 in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
                                     if c2 not in df.columns: df[c2] = default2
                                 df.loc[df['ID']==w['ID'],'Active'] = True
-                                write_table_replace("workers", df)
-                                st.rerun()
+                                write_table_replace("workers", df); log_action("Activate Worker", f"Activated worker ID {w['ID']}"); st.rerun()
                     with col2:
-                        if st.button("🗑️ Delete", key=f"sup_del_{w['ID']}"):
+                        if st.button("🗑️ Delete", key=f"sup_del_{w.get('ID','')}"):
                             df = read_table("workers")
                             df = df[df['ID'] != w['ID']]
                             write_table_replace("workers", df)
+                            log_action("Delete Worker", f"Deleted worker ID {w['ID']}")
                             st.rerun()
         else:
             st.info("No workers found")
@@ -1085,34 +1182,26 @@ def supervisor_dashboard():
 
             if not filtered.empty:
                 st.write(f"### Attendance Register - {view_date.strftime('%B %d, %Y')}")
-                
-                # Check if filtered attendance has required columns before processing
                 expected_att_cols = ['Worker_Name','Section','Department','Shift','Status','Timestamp']
                 missing_att_cols = [col for col in expected_att_cols if col not in filtered.columns]
-                
                 if missing_att_cols:
-                    st.warning(f"⚠️ Attendance table missing columns: {', '.join(missing_att_cols)}")
-                    # Add missing columns with empty values
                     for col in missing_att_cols:
                         filtered[col] = ""
-                
-                # Use only available columns for display
                 display_cols = [col for col in expected_att_cols if col in filtered.columns]
                 if display_cols:
                     st.dataframe(filtered[display_cols], width='stretch')
                 else:
                     st.dataframe(filtered, width='stretch')
-                
                 total = len(filtered)
                 present = (filtered['Status']=='Present').sum() if 'Status' in filtered.columns else 0
                 absent = (filtered['Status']=='Absent').sum() if 'Status' in filtered.columns else 0
                 late = (filtered['Status']=='Late').sum() if 'Status' in filtered.columns else 0
                 leave = (filtered['Status']=='Leave').sum() if 'Status' in filtered.columns else 0
                 c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Present", present, f"{present/total*100:.1f}%" if total > 0 else "0%")
-                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%" if total > 0 else "0%")
-                with c3: st.metric("Late", late, f"{late/total*100:.1f}%" if total > 0 else "0%")
-                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%" if total > 0 else "0%")
+                with c1: st.metric("Present", present, f"{present/total*100:.1f}%" if total>0 else "0%")
+                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%" if total>0 else "0%")
+                with c3: st.metric("Late", late, f"{late/total*100:.1f}%" if total>0 else "0%")
+                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%" if total>0 else "0%")
             else:
                 st.info("No records found")
         else:
@@ -1144,8 +1233,6 @@ def supervisor_dashboard():
         else:
             st.info("No attendance data available for the selected period.")
 
-# ----------------- HR DASHBOARD ---------------------------
-
 def hr_dashboard():
     st.title("📊 HR Dashboard")
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Daily","📅 Monthly","👥 Directory", "📊 Attendance Grid"])
@@ -1163,23 +1250,16 @@ def hr_dashboard():
             attendance_df["Date"] = pd.to_datetime(attendance_df["Date"]).dt.date
             filtered = attendance_df[attendance_df["Date"] == view_date]
             if not filtered.empty:
-                # Check if filtered attendance has required columns before processing
                 expected_att_cols = ['Worker_Name','Section','Department','Shift','Status','Timestamp']
                 missing_att_cols = [col for col in expected_att_cols if col not in filtered.columns]
-                
                 if missing_att_cols:
-                    st.warning(f"⚠️ Attendance table missing columns: {', '.join(missing_att_cols)}")
-                    # Add missing columns with empty values
                     for col in missing_att_cols:
                         filtered[col] = ""
-                
-                # Use only available columns for display
                 display_cols = [col for col in expected_att_cols if col in filtered.columns]
                 if display_cols:
                     st.dataframe(filtered[display_cols], width='stretch')
                 else:
                     st.dataframe(filtered, width='stretch')
-                
                 total = len(filtered)
                 present = (filtered['Status']=='Present').sum() if 'Status' in filtered.columns else 0
                 absent = (filtered['Status']=='Absent').sum() if 'Status' in filtered.columns else 0
@@ -1218,24 +1298,17 @@ def hr_dashboard():
                     Total=('Status', 'count')
                 ).reset_index()
                 worker_stats['Attendance %'] = (worker_stats['Present'] / worker_stats['Total'] * 100).round(1)
-
-                # Check if workers_df has required columns before merging
                 expected_worker_cols = ['Name','Section','Department','Shift']
                 missing_worker_cols = [col for col in expected_worker_cols if col not in workers_df.columns]
-                
                 if not missing_worker_cols:
                     worker_details = workers_df[['Name','Section','Department','Shift']].copy()
                     worker_stats = worker_stats.merge(
                         worker_details, left_on='Worker_Name', right_on='Name', how='left'
                     ).drop('Name', axis=1)
                 else:
-                    st.warning(f"⚠️ Workers table missing columns: {', '.join(missing_worker_cols)}")
-                    # Add missing columns with empty values
                     for col in missing_worker_cols:
                         worker_stats[col] = ""
-
                 st.dataframe(worker_stats, width='stretch')
-
                 total_records = len(monthly)
                 total_present = (monthly['Status']=='Present').sum()
                 total_absent = (monthly['Status']=='Absent').sum()
@@ -1246,7 +1319,6 @@ def hr_dashboard():
                 with c2: st.metric("Present", total_present, f"{total_present/total_records*100:.1f}%")
                 with c3: st.metric("Absent", total_absent, f"{total_absent/total_records*100:.1f}%")
                 with c4: st.metric("Late", total_late, f"{total_late/total_records*100:.1f}%")
-
                 st.download_button(
                     "📥 Download Monthly Report",
                     worker_stats.to_csv(index=False).encode("utf-8"),
@@ -1261,27 +1333,17 @@ def hr_dashboard():
     with tab3:
         st.subheader("👥 Worker Directory")
         if not workers_df.empty:
-            # Check if workers_df has required columns before processing
             expected_worker_cols = ['Name','Section','Department','Shift','Active']
             missing_worker_cols = [col for col in expected_worker_cols if col not in workers_df.columns]
-            
             if missing_worker_cols:
-                st.warning(f"⚠️ Workers table missing columns: {', '.join(missing_worker_cols)}")
-                # Add missing columns with default values
                 for col in missing_worker_cols:
-                    if col == 'Active':
-                        workers_df[col] = True
-                    else:
-                        workers_df[col] = ""
-            
+                    workers_df[col] = True if col=='Active' else ""
             if 'Active' in workers_df.columns:
                 workers_df['Active'] = workers_df['Active'].astype(str)
                 active_workers = workers_df[workers_df['Active'].str.lower().isin(['true','1','yes'])]
             else:
                 active_workers = workers_df
-                
             if not active_workers.empty:
-                # Check which columns are available for display
                 display_cols = [col for col in ['Name','Section','Department','Shift'] if col in active_workers.columns]
                 if display_cols:
                     st.dataframe(
@@ -1337,7 +1399,7 @@ def login_page():
         st.subheader("Login")
         username = st.text_input("Username", key="login_username")
         password = st.text_input("Password", type="password", key="login_password")
-        if st.button("Login", type="primary", width='stretch'):
+        if st.button("Login", type="primary", key="login_btn"):
             if login(username, password):
                 st.success(f"Welcome, {username}!")
                 time.sleep(0.7)
@@ -1350,30 +1412,42 @@ def login_page():
 def main():
     st.markdown(mobile_css(), unsafe_allow_html=True)
 
-    # Ensure DB & seed BEFORE any UI
-    initialize_databases()
-    seed_defaults()
+    # Initialize DB once per session (prevents constant rebuilds)
+    if "db_initialized" not in st.session_state:
+        # Ensure local DB file exists (SQLite will create if missing)
+        if not os.path.exists("attendance_offline.db"):
+            # Touch file indirectly by initializing DB
+            initialize_databases()
+        initialize_databases()
+        seed_defaults()
+        st.session_state["db_initialized"] = True
 
     # Sidebar status + sync
     with st.sidebar:
         if is_online():
-            nw, na = sync_from_sqlite_to_supabase()
+            nw, na, nl = sync_from_sqlite_to_supabase()
             eng = get_online_engine_or_none()
-            with eng.connect() as conn:
-                now = conn.execute(text("SELECT NOW()")).scalar()
-            st.success(f"🟢 Online (Supabase Pooler)\n{now}")
-            if nw or na:
-                st.info(f"Synced: {nw} worker(s), {na} attendance record(s)")
+            try:
+                with eng.connect() as conn:
+                    now = conn.execute(text("SELECT NOW()")).scalar()
+                st.success(f"🟢 Online (Supabase Pooler)\n{now}")
+            except Exception:
+                st.success("🟢 Online (Supabase Pooler)")
+            if nw or na or nl:
+                st.info(f"Synced: {nw} worker(s), {na} attendance record(s), {nl} log(s)")
         else:
             eng = get_offline_engine()
-            with eng.connect() as conn:
-                now = conn.execute(text("SELECT datetime('now')")).scalar()
-            st.warning(f"🔵 Offline (SQLite)\n{now}")
+            try:
+                with eng.connect() as conn:
+                    now = conn.execute(text("SELECT datetime('now')")).scalar()
+                st.warning(f"🔵 Offline (SQLite)\n{now}")
+            except Exception:
+                st.warning("🔵 Offline (SQLite)")
 
         if st.button("🔄 Sync Now"):
             if is_online():
-                nw, na = sync_from_sqlite_to_supabase()
-                st.success(f"Synced {nw} worker(s), {na} attendance record(s)")
+                nw, na, nl = sync_from_sqlite_to_supabase()
+                st.success(f"Synced {nw} worker(s), {na} attendance record(s), {nl} log(s)")
             else:
                 st.info("Still offline — will sync when online.")
 
