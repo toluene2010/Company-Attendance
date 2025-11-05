@@ -508,13 +508,12 @@ with col1:
                     st.rerun()
             else:
                 st.error("Enter department name and select section")
-
-                    if dept_name and section_id:
-                        df = read_table("departments")
-                        new_id = int(df['ID'].max())+1 if not df.empty and 'ID' in df.columns else 1
-                        new_department = pd.DataFrame([{'ID':new_id,'Name':dept_name,'Section_ID':section_id,'Description':desc}])
-                        df = pd.concat([df, new_department], ignore_index=True)
-                        if write_table_replace("departments", df):
+                if dept_name and section_id:
+                    df = read_table("departments")
+                    new_id = int(df['ID'].max())+1 if not df.empty and 'ID' in df.columns else 1
+                    new_department = pd.DataFrame([{'ID':new_id,'Name':dept_name,'Section_ID':section_id,'Description':desc}])
+                    df = pd.concat([df, new_department], ignore_index=True)
+                    if write_table_replace("departments", df):
                             st.success("Department added")
                             st.rerun()
                     else:
