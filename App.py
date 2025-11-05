@@ -429,7 +429,7 @@ def admin_dashboard():
                 if missing:
                     st.warning(f"Rebuilding users table (missing columns: {', '.join(missing)})")
                     initialize_databases(); seed_defaults(); df = read_table("users")
-                st.dataframe(df[[c for c in expected_cols if c in df.columns]], use_container_width=True)
+                st.dataframe(df[[c for c in expected_cols if c in df.columns]], width='stretch')
 
     # ---- Sections ----
     with tab2:
@@ -454,7 +454,7 @@ def admin_dashboard():
                         st.error("Enter section name")
         with col2:
             if not sections_df.empty:
-                st.dataframe(sections_df, use_container_width=True)
+                st.dataframe(sections_df, width='stretch')
             else:
                 st.info("No sections found")
 
@@ -511,12 +511,39 @@ def admin_dashboard():
         
         with col2:
             if not departments_df.empty:
-                merged = departments_df.merge(
-                    sections_df[['ID','Name']], left_on='Section_ID', right_on='ID', how='left', suffixes=('', '_section')
-                )
-                merged = merged.rename(columns={'Name':'Department','Name_section':'Section'})
-                merged = merged.drop(columns=['ID_section'])
-                st.dataframe(merged[['ID','Department','Section','Description']], use_container_width=True)
+                # Check if departments_df has required columns before displaying
+                expected_dept_cols = ['ID', 'Name', 'Section_ID', 'Description']
+                missing_dept_cols = [col for col in expected_dept_cols if col not in departments_df.columns]
+                
+                if missing_dept_cols:
+                    st.warning(f"⚠️ Departments table missing columns: {', '.join(missing_dept_cols)}")
+                    st.info("Rebuilding departments table with proper structure...")
+                    initialize_databases()
+                    seed_defaults()
+                    departments_df = read_table("departments")
+                
+                # Check if sections_df has required columns before merging
+                if not sections_df.empty and all(col in sections_df.columns for col in ['ID', 'Name']):
+                    merged = departments_df.merge(
+                        sections_df[['ID','Name']], left_on='Section_ID', right_on='ID', how='left', suffixes=('', '_section')
+                    )
+                    merged = merged.rename(columns={'Name':'Department','Name_section':'Section'})
+                    merged = merged.drop(columns=['ID_section'])
+                    st.dataframe(merged[['ID','Department','Section','Description']], width='stretch')
+                else:
+                    # If sections data is not available, just show departments without section names
+                    if all(col in departments_df.columns for col in ['ID','Name','Section_ID','Description']):
+                        st.dataframe(departments_df[['ID','Name','Section_ID','Description']], width='stretch')
+                    else:
+                        # Show whatever columns are available
+                        available_cols = [col for col in departments_df.columns if col in expected_dept_cols]
+                        if available_cols:
+                            st.dataframe(departments_df[available_cols], width='stretch')
+                        else:
+                            st.dataframe(departments_df, width='stretch')
+                    
+                    if sections_df.empty:
+                        st.warning("No sections found - section names will not be displayed")
             else:
                 st.info("No departments found")
 
@@ -593,7 +620,7 @@ def admin_dashboard():
                 w_name = st.text_input("Name")
                 w_section = st.selectbox("Section", sections_df['Name'].tolist() if not sections_df.empty else [], key="admin_add_section")
 
-                if w_section and not sections_df.empty:
+                if w_section and not sections_df.empty and 'Name' in sections_df.columns and 'ID' in sections_df.columns:
                     section_id = sections_df[sections_df['Name'] == w_section]['ID'].values[0]
                     dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
                 else:
@@ -671,7 +698,7 @@ def admin_dashboard():
             filtered = att[att['Date'] == view_date]
             if not filtered.empty:
                 st.write(f"Attendance for {view_date.strftime('%B %d, %Y')}")
-                st.dataframe(filtered[['Worker_Name','Section','Department','Shift','Status','Timestamp']], use_container_width=True)
+                st.dataframe(filtered[['Worker_Name','Section','Department','Shift','Status','Timestamp']], width='stretch')
                 total = len(filtered)
                 present = (filtered['Status'] == 'Present').sum()
                 absent = (filtered['Status'] == 'Absent').sum()
@@ -733,8 +760,9 @@ def supervisor_dashboard():
 
         col1, col2 = st.columns(2)
         with col1:
-            selected_section = st.selectbox("Select Section", ["All"] + (sections_df['Name'].tolist() if not sections_df.empty else []), key="mark_section")
-            if selected_section != "All" and not sections_df.empty:
+            section_options = ["All"] + (sections_df['Name'].tolist() if not sections_df.empty and 'Name' in sections_df.columns else [])
+            selected_section = st.selectbox("Select Section", section_options, key="mark_section")
+            if selected_section != "All" and not sections_df.empty and 'Name' in sections_df.columns and 'ID' in sections_df.columns:
                 section_id = sections_df[sections_df['Name'] == selected_section]['ID'].values[0]
                 dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
             else:
@@ -848,8 +876,9 @@ def supervisor_dashboard():
 
         col1, col2 = st.columns(2)
         with col1:
-            reg_section = st.selectbox("Select Section", ["All"] + (sections_df['Name'].tolist() if not sections_df.empty else []), key="reg_section")
-            if reg_section != "All" and not sections_df.empty:
+            section_options = ["All"] + (sections_df['Name'].tolist() if not sections_df.empty and 'Name' in sections_df.columns else [])
+            reg_section = st.selectbox("Select Section", section_options, key="reg_section")
+            if reg_section != "All" and not sections_df.empty and 'Name' in sections_df.columns and 'ID' in sections_df.columns:
                 section_id = sections_df[sections_df['Name'] == reg_section]['ID'].values[0]
                 dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
             else:
@@ -868,22 +897,40 @@ def supervisor_dashboard():
 
             if not filtered.empty:
                 st.write(f"### Attendance Register for {reg_date.strftime('%B %d, %Y')}")
+                # Check if filtered attendance has required columns before processing
+                expected_att_cols = ['Worker_Name','Section','Department','Shift','Status','Timestamp']
+                missing_att_cols = [col for col in expected_att_cols if col not in filtered.columns]
+                
+                if missing_att_cols:
+                    st.warning(f"⚠️ Attendance table missing columns: {', '.join(missing_att_cols)}")
+                    # Add missing columns with empty values
+                    for col in missing_att_cols:
+                        filtered[col] = ""
+                
                 editable_df = filtered.copy()
                 editable_df["Edit"] = False
-                edited_df = st.data_editor(
-                    editable_df[['Worker_Name','Section','Department','Shift','Status','Timestamp','Edit']],
-                    use_container_width=True,
-                    column_config={
-                        "Worker_Name": st.column_config.TextColumn("Worker Name", disabled=True),
-                        "Section": st.column_config.TextColumn("Section", disabled=True),
-                        "Department": st.column_config.TextColumn("Department", disabled=True),
-                        "Shift": st.column_config.TextColumn("Shift", disabled=True),
-                        "Status": st.column_config.TextColumn("Status", disabled=True),
-                        "Timestamp": st.column_config.TextColumn("Timestamp", disabled=True),
-                        "Edit": st.column_config.CheckboxColumn("Edit for Changes")
-                    },
-                    hide_index=True
-                )
+                
+                # Use only available columns for display
+                display_cols = [col for col in expected_att_cols if col in editable_df.columns]
+                if display_cols:
+                    display_cols.append("Edit")
+                    edited_df = st.data_editor(
+                         editable_df[display_cols],
+                         width='stretch',
+                        column_config={
+                            "Worker_Name": st.column_config.TextColumn("Worker Name", disabled=True),
+                            "Section": st.column_config.TextColumn("Section", disabled=True),
+                            "Department": st.column_config.TextColumn("Department", disabled=True),
+                            "Shift": st.column_config.TextColumn("Shift", disabled=True),
+                            "Status": st.column_config.TextColumn("Status", disabled=True),
+                            "Timestamp": st.column_config.TextColumn("Timestamp", disabled=True),
+                            "Edit": st.column_config.CheckboxColumn("Edit for Changes")
+                        },
+                        hide_index=True
+                    )
+                else:
+                    st.info("No attendance data available for editing")
+                    edited_df = pd.DataFrame()
                 records_to_edit = edited_df[edited_df["Edit"] == True]
                 if not records_to_edit.empty:
                     st.subheader("Edit Selected Records")
@@ -953,8 +1000,9 @@ def supervisor_dashboard():
                 st.write(f"Current: {row.get('Section','')} / {row.get('Department','')} - {row.get('Shift','')}")
                 col1, col2, _ = st.columns(3)
                 with col1:
-                    new_section = st.selectbox("New Section", sections_df['Name'].tolist(), key="new_section")
-                    if new_section and not sections_df.empty:
+                    section_options = sections_df['Name'].tolist() if not sections_df.empty and 'Name' in sections_df.columns else []
+                    new_section = st.selectbox("New Section", section_options, key="new_section")
+                    if new_section and not sections_df.empty and 'Name' in sections_df.columns and 'ID' in sections_df.columns:
                         section_id = sections_df[sections_df['Name'] == new_section]['ID'].values[0]
                         dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
                     else:
@@ -1020,8 +1068,9 @@ def supervisor_dashboard():
         if not att.empty and "Date" in att.columns:
             att["Date"] = pd.to_datetime(att["Date"]).dt.date
             view_date = st.date_input("Date", datetime.date.today(), key="sup_view_date")
-            view_section = st.selectbox("Section", ["All"] + (sections_df['Name'].tolist() if not sections_df.empty else []), key="sup_view_section")
-            if view_section != "All" and not sections_df.empty:
+            section_options = ["All"] + (sections_df['Name'].tolist() if not sections_df.empty and 'Name' in sections_df.columns else [])
+            view_section = st.selectbox("Section", section_options, key="sup_view_section")
+            if view_section != "All" and not sections_df.empty and 'Name' in sections_df.columns and 'ID' in sections_df.columns:
                 section_id = sections_df[sections_df['Name'] == view_section]['ID'].values[0]
                 dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
             else:
@@ -1036,17 +1085,34 @@ def supervisor_dashboard():
 
             if not filtered.empty:
                 st.write(f"### Attendance Register - {view_date.strftime('%B %d, %Y')}")
-                st.dataframe(filtered[['Worker_Name','Section','Department','Shift','Status','Timestamp']], use_container_width=True)
+                
+                # Check if filtered attendance has required columns before processing
+                expected_att_cols = ['Worker_Name','Section','Department','Shift','Status','Timestamp']
+                missing_att_cols = [col for col in expected_att_cols if col not in filtered.columns]
+                
+                if missing_att_cols:
+                    st.warning(f"⚠️ Attendance table missing columns: {', '.join(missing_att_cols)}")
+                    # Add missing columns with empty values
+                    for col in missing_att_cols:
+                        filtered[col] = ""
+                
+                # Use only available columns for display
+                display_cols = [col for col in expected_att_cols if col in filtered.columns]
+                if display_cols:
+                    st.dataframe(filtered[display_cols], width='stretch')
+                else:
+                    st.dataframe(filtered, width='stretch')
+                
                 total = len(filtered)
-                present = (filtered['Status']=='Present').sum()
-                absent = (filtered['Status']=='Absent').sum()
-                late = (filtered['Status']=='Late').sum()
-                leave = (filtered['Status']=='Leave').sum()
+                present = (filtered['Status']=='Present').sum() if 'Status' in filtered.columns else 0
+                absent = (filtered['Status']=='Absent').sum() if 'Status' in filtered.columns else 0
+                late = (filtered['Status']=='Late').sum() if 'Status' in filtered.columns else 0
+                leave = (filtered['Status']=='Leave').sum() if 'Status' in filtered.columns else 0
                 c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Present", present, f"{present/total*100:.1f}%")
-                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%")
-                with c3: st.metric("Late", late, f"{late/total*100:.1f}%")
-                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%")
+                with c1: st.metric("Present", present, f"{present/total*100:.1f}%" if total > 0 else "0%")
+                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%" if total > 0 else "0%")
+                with c3: st.metric("Late", late, f"{late/total*100:.1f}%" if total > 0 else "0%")
+                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%" if total > 0 else "0%")
             else:
                 st.info("No records found")
         else:
@@ -1067,7 +1133,7 @@ def supervisor_dashboard():
         grid_df = generate_attendance_grid(year, month)
         if not grid_df.empty:
             st.markdown('<div class="attendance-grid">', unsafe_allow_html=True)
-            st.dataframe(grid_df, use_container_width=True)
+            st.dataframe(grid_df, width='stretch')
             st.markdown('</div>', unsafe_allow_html=True)
             st.download_button(
                 "📥 Download Attendance Grid",
@@ -1097,17 +1163,33 @@ def hr_dashboard():
             attendance_df["Date"] = pd.to_datetime(attendance_df["Date"]).dt.date
             filtered = attendance_df[attendance_df["Date"] == view_date]
             if not filtered.empty:
-                st.dataframe(filtered[['Worker_Name','Section','Department','Shift','Status','Timestamp']], use_container_width=True)
+                # Check if filtered attendance has required columns before processing
+                expected_att_cols = ['Worker_Name','Section','Department','Shift','Status','Timestamp']
+                missing_att_cols = [col for col in expected_att_cols if col not in filtered.columns]
+                
+                if missing_att_cols:
+                    st.warning(f"⚠️ Attendance table missing columns: {', '.join(missing_att_cols)}")
+                    # Add missing columns with empty values
+                    for col in missing_att_cols:
+                        filtered[col] = ""
+                
+                # Use only available columns for display
+                display_cols = [col for col in expected_att_cols if col in filtered.columns]
+                if display_cols:
+                    st.dataframe(filtered[display_cols], width='stretch')
+                else:
+                    st.dataframe(filtered, width='stretch')
+                
                 total = len(filtered)
-                present = (filtered['Status']=='Present').sum()
-                absent = (filtered['Status']=='Absent').sum()
-                late = (filtered['Status']=='Late').sum()
-                leave = (filtered['Status']=='Leave').sum()
+                present = (filtered['Status']=='Present').sum() if 'Status' in filtered.columns else 0
+                absent = (filtered['Status']=='Absent').sum() if 'Status' in filtered.columns else 0
+                late = (filtered['Status']=='Late').sum() if 'Status' in filtered.columns else 0
+                leave = (filtered['Status']=='Leave').sum() if 'Status' in filtered.columns else 0
                 c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Present", present, f"{present/total*100:.1f}%")
-                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%")
-                with c3: st.metric("Late", late, f"{late/total*100:.1f}%")
-                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%")
+                with c1: st.metric("Present", present, f"{present/total*100:.1f}%" if total > 0 else "0%")
+                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%" if total > 0 else "0%")
+                with c3: st.metric("Late", late, f"{late/total*100:.1f}%" if total > 0 else "0%")
+                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%" if total > 0 else "0%")
             else:
                 st.info("No attendance records for date")
         else:
@@ -1137,12 +1219,22 @@ def hr_dashboard():
                 ).reset_index()
                 worker_stats['Attendance %'] = (worker_stats['Present'] / worker_stats['Total'] * 100).round(1)
 
-                worker_details = workers_df[['Name','Section','Department','Shift']].copy()
-                worker_stats = worker_stats.merge(
-                    worker_details, left_on='Worker_Name', right_on='Name', how='left'
-                ).drop('Name', axis=1)
+                # Check if workers_df has required columns before merging
+                expected_worker_cols = ['Name','Section','Department','Shift']
+                missing_worker_cols = [col for col in expected_worker_cols if col not in workers_df.columns]
+                
+                if not missing_worker_cols:
+                    worker_details = workers_df[['Name','Section','Department','Shift']].copy()
+                    worker_stats = worker_stats.merge(
+                        worker_details, left_on='Worker_Name', right_on='Name', how='left'
+                    ).drop('Name', axis=1)
+                else:
+                    st.warning(f"⚠️ Workers table missing columns: {', '.join(missing_worker_cols)}")
+                    # Add missing columns with empty values
+                    for col in missing_worker_cols:
+                        worker_stats[col] = ""
 
-                st.dataframe(worker_stats, use_container_width=True)
+                st.dataframe(worker_stats, width='stretch')
 
                 total_records = len(monthly)
                 total_present = (monthly['Status']=='Present').sum()
@@ -1169,20 +1261,42 @@ def hr_dashboard():
     with tab3:
         st.subheader("👥 Worker Directory")
         if not workers_df.empty:
-            workers_df['Active'] = workers_df['Active'].astype(str)
-            active_workers = workers_df[workers_df['Active'].str.lower().isin(['true','1','yes'])]
+            # Check if workers_df has required columns before processing
+            expected_worker_cols = ['Name','Section','Department','Shift','Active']
+            missing_worker_cols = [col for col in expected_worker_cols if col not in workers_df.columns]
+            
+            if missing_worker_cols:
+                st.warning(f"⚠️ Workers table missing columns: {', '.join(missing_worker_cols)}")
+                # Add missing columns with default values
+                for col in missing_worker_cols:
+                    if col == 'Active':
+                        workers_df[col] = True
+                    else:
+                        workers_df[col] = ""
+            
+            if 'Active' in workers_df.columns:
+                workers_df['Active'] = workers_df['Active'].astype(str)
+                active_workers = workers_df[workers_df['Active'].str.lower().isin(['true','1','yes'])]
+            else:
+                active_workers = workers_df
+                
             if not active_workers.empty:
-                st.dataframe(
-                    active_workers[['Name','Section','Department','Shift']],
-                    use_container_width=True,
-                    hide_index=True
-                )
-                st.download_button(
-                    "📥 Download Worker Directory",
-                    dataframe_to_excel_bytes(active_workers[['Name','Section','Department','Shift']]),
-                    file_name="worker_directory.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                # Check which columns are available for display
+                display_cols = [col for col in ['Name','Section','Department','Shift'] if col in active_workers.columns]
+                if display_cols:
+                    st.dataframe(
+                        active_workers[display_cols],
+                        width='stretch',
+                        hide_index=True
+                    )
+                    st.download_button(
+                        "📥 Download Worker Directory",
+                        dataframe_to_excel_bytes(active_workers[display_cols]),
+                        file_name="worker_directory.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.dataframe(active_workers, width='stretch')
             else:
                 st.info("No active workers found")
         else:
@@ -1202,7 +1316,7 @@ def hr_dashboard():
         grid_df = generate_attendance_grid(year, month)
         if not grid_df.empty:
             st.markdown('<div class="attendance-grid">', unsafe_allow_html=True)
-            st.dataframe(grid_df, use_container_width=True)
+            st.dataframe(grid_df, width='stretch')
             st.markdown('</div>', unsafe_allow_html=True)
             st.download_button(
                 "📥 Download Attendance Grid",
@@ -1223,7 +1337,7 @@ def login_page():
         st.subheader("Login")
         username = st.text_input("Username", key="login_username")
         password = st.text_input("Password", type="password", key="login_password")
-        if st.button("Login", type="primary", use_container_width=True):
+        if st.button("Login", type="primary", width='stretch'):
             if login(username, password):
                 st.success(f"Welcome, {username}!")
                 time.sleep(0.7)
