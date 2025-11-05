@@ -233,13 +233,16 @@ def current_engine():
 def read_table(table):
     eng = current_engine()
     try:
-        return pd.read_sql(f"SELECT * FROM {table}", eng)
+        df = pd.read_sql(f"SELECT * FROM {table}", eng)
+        return df
     except Exception as e:
-        # If table doesn't exist, initialize databases and retry once
-        initialize_databases()
-        ensure_seed_data()
+        # Table missing or schema mismatch → rebuild everything
+        st.warning(f"⚙️ Rebuilding tables... ({table} missing or invalid)")
         try:
-            return pd.read_sql(f"SELECT * FROM {table}", eng)
+            initialize_databases()
+            ensure_seed_data()
+            df = pd.read_sql(f"SELECT * FROM {table}", eng)
+            return df
         except Exception:
             return pd.DataFrame()
 
@@ -426,7 +429,17 @@ def admin_dashboard():
             st.markdown("#### 📋 Users")
             if df.empty: st.info("No users"); 
             else:
-                st.dataframe(df[["ID","Name","Username","Role","Active","Assigned_Section","Assigned_Shift"]], use_container_width=True)
+                expected_cols = ["ID","Name","Username","Role","Active","Assigned_Section","Assigned_Shift"]
+missing = [c for c in expected_cols if c not in df.columns]
+if missing:
+    st.warning(f"Rebuilding users table (missing columns: {', '.join(missing)})")
+    initialize_databases()
+    ensure_seed_data()
+    df = read_table("users")
+if not df.empty:
+    st.dataframe(df[[c for c in expected_cols if c in df.columns]], use_container_width=True)
+else:
+    st.info("No users found yet. Default admin = admin / admin123")
 
     # SECTIONS
     with tabs[1]:
