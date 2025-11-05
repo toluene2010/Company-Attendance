@@ -234,8 +234,14 @@ def read_table(table):
     eng = current_engine()
     try:
         return pd.read_sql(f"SELECT * FROM {table}", eng)
-    except Exception:
-        return pd.DataFrame()
+    except Exception as e:
+        # If table doesn't exist, initialize databases and retry once
+        initialize_databases()
+        ensure_seed_data()
+        try:
+            return pd.read_sql(f"SELECT * FROM {table}", eng)
+        except Exception:
+            return pd.DataFrame()
 
 def write_table_replace(table, df: pd.DataFrame) -> bool:
     eng = current_engine()
