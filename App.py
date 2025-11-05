@@ -3,1277 +3,920 @@ import pandas as pd
 import datetime
 import time
 import os
+import json
 import bcrypt
 import calendar
 from io import BytesIO
 
-from sqlalchemy import (
-    create_engine, text, MetaData, Table, Column,
-    Integer, String, Boolean, Date, DateTime
-)
+from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
-# ==================== CONFIGURATION ====================
-# Uses Streamlit secrets on Streamlit Cloud; falls back to env vars locally
-try:
-    DB_USER = st.secrets["database"]["DB_USER"]
-    DB_PASSWORD = st.secrets["database"]["DB_PASSWORD"]
-    DB_HOST = st.secrets["database"]["DB_HOST"]
-    DB_PORT = st.secrets["database"]["DB_PORT"]
-    DB_NAME = st.secrets["database"]["DB_NAME"]
-except Exception:
-    DB_USER = os.getenv("DB_USER", "")
-    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-    DB_HOST = os.getenv("DB_HOST", "")
-    DB_PORT = os.getenv("DB_PORT", "5432")
-    DB_NAME = os.getenv("DB_NAME", "")
+# ==========================================================
+# CONFIG — Hybrid DB: Supabase (Pooler) when online, SQLite when offline
+# ==========================================================
 
-if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME]):
-    st.error("❌ Database credentials missing. Add them to `.streamlit/secrets.toml` or environment variables.")
-    st.stop()
+SQLITE_URL = "sqlite:///attendance_offline.db"
 
-# Prefer the explicit psycopg2 dialect
-DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
-# ==================== DATABASE CONNECTION ====================
 @st.cache_resource
-def get_db_connection():
+def build_supabase_url_from_secrets():
     try:
-        engine = create_engine(
-            DATABASE_URL,
-            poolclass=NullPool,
-            connect_args={'connect_timeout': 10}
-        )
-        with engine.connect() as conn:
-            conn.execute(text("CREATE SCHEMA IF NOT EXISTS attendance"))
-            conn.commit()
-        return engine
-    except Exception as e:
-        st.error(f"Error connecting to database: {e}")
+        u = st.secrets["database"]["DB_USER"]
+        p = st.secrets["database"]["DB_PASSWORD"]
+        h = st.secrets["database"]["DB_HOST"]
+        po = st.secrets["database"]["DB_PORT"]
+        db = st.secrets["database"]["DB_NAME"]
+        return f"postgresql+psycopg2://{u}:{p}@{h}:{po}/{db}"
+    except Exception:
         return None
 
-def execute_query(query, params=None):
-    engine = get_db_connection()
-    if engine is None:
-        return None
+SUPABASE_URL = build_supabase_url_from_secrets()
+
+@st.cache_resource
+def get_engine(url: str):
+    return create_engine(url, poolclass=NullPool)
+
+def _try_ping(engine) -> bool:
     try:
         with engine.connect() as conn:
-            result = conn.execute(text(query), params or {})
-            if query.strip().upper().startswith("SELECT"):
-                return result.fetchall()
+            if "postgresql" in str(engine.url):
+                conn.execute(text("SELECT NOW()"))
             else:
-                conn.commit()
-                return True
-    except Exception as e:
-        st.error(f"Database error: {e}")
-        return None
-
-def read_table(table_name):
-    engine = get_db_connection()
-    if engine is None:
-        return pd.DataFrame()
-    try:
-        query = f"SELECT * FROM attendance.{table_name}"
-        df = pd.read_sql(query, engine)
-        return df
-    except Exception as e:
-        st.warning(f"Error reading from table {table_name}: {e}")
-        return pd.DataFrame()
-    finally:
-        engine.dispose()
-
-def write_table(table_name, df):
-    engine = get_db_connection()
-    if engine is None:
-        return False
-    try:
-        df.to_sql(table_name, engine, if_exists='replace', index=False, schema='attendance')
+                conn.execute(text("SELECT datetime('now')"))
         return True
-    except Exception as e:
-        st.error(f"Error writing to table {table_name}: {e}")
-        return False
-    finally:
-        engine.dispose()
-
-def table_exists(table_name):
-    engine = get_db_connection()
-    if engine is None:
-        return False
-    try:
-        with engine.connect() as conn:
-            query = text("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'attendance' 
-                    AND table_name = :table_name
-                )
-            """)
-            result = conn.execute(query, {"table_name": table_name})
-            return result.scalar()
-    except Exception as e:
-        st.error(f"Error checking if table {table_name} exists: {e}")
-        return False
-
-# ==================== INITIALIZATION ====================
-def initialize_system():
-    engine = get_db_connection()
-    if engine is None:
-        st.error("Cannot connect to database. System initialization failed.")
-        st.stop()
-
-    metadata = MetaData()
-
-    # Define tables in attendance schema
-    shifts = Table(
-        'shifts', metadata,
-        Column('ID', Integer, primary_key=True),
-        Column('Name', String(255), nullable=False),
-        schema='attendance'
-    )
-    sections = Table(
-        'sections', metadata,
-        Column('ID', Integer, primary_key=True),
-        Column('Name', String(255), nullable=False),
-        Column('Description', String(500)),
-        schema='attendance'
-    )
-    departments = Table(
-        'departments', metadata,
-        Column('ID', Integer, primary_key=True),
-        Column('Name', String(255), nullable=False),
-        Column('Section_ID', Integer),
-        Column('Description', String(500)),
-        schema='attendance'
-    )
-    users = Table(
-        'users', metadata,
-        Column('ID', Integer, primary_key=True),
-        Column('Name', String(255), nullable=False),
-        Column('Username', String(255), nullable=False, unique=True),
-        Column('Password', String(255), nullable=False),   # bcrypt hash
-        Column('Role', String(50), nullable=False),
-        Column('Active', Boolean, default=True),
-        Column('Assigned_Section', String(255)),
-        Column('Assigned_Shift', String(255)),
-        schema='attendance'
-    )
-    workers = Table(
-        'workers', metadata,
-        Column('ID', Integer, primary_key=True),
-        Column('Name', String(255), nullable=False),
-        Column('Section', String(255)),
-        Column('Department', String(255)),
-        Column('Shift', String(255)),
-        Column('Active', Boolean, default=True),
-        schema='attendance'
-    )
-    attendance = Table(
-        'attendance', metadata,
-        Column('ID', Integer, primary_key=True),
-        Column('Worker_ID', Integer),
-        Column('Worker_Name', String(255), nullable=False),
-        Column('Date', Date, nullable=False),
-        Column('Section', String(255)),
-        Column('Department', String(255)),
-        Column('Shift', String(255)),
-        Column('Status', String(50), nullable=False),
-        Column('Timestamp', DateTime, default=datetime.datetime.now),
-        schema='attendance'
-    )
-
-    try:
-        metadata.create_all(engine)
-    except Exception as e:
-        st.error(f"Error creating database tables: {e}")
-        st.stop()
-
-    # Insert default data if empty
-    if read_table("shifts").empty:
-        write_table("shifts", pd.DataFrame({'ID':[1,2,3],'Name':['Morning','Afternoon','General']}))
-
-    if read_table("sections").empty:
-        write_table("sections", pd.DataFrame({
-            'ID': [1, 2, 3],
-            'Name': ['Liquid Section', 'Solid Section', 'Utility Section'],
-            'Description': ['Liquid manufacturing', 'Solid manufacturing', 'Utility services']
-        }))
-
-    if read_table("departments").empty:
-        write_table("departments", pd.DataFrame({
-            'ID': [1, 2, 3, 4],
-            'Name': ['Mixing', 'Filling', 'Packaging', 'Maintenance'],
-            'Section_ID': [1, 1, 2, 3],
-            'Description': ['Mixing department', 'Filling department', 'Packaging department', 'Maintenance department']
-        }))
-
-    if read_table("users").empty:
-        # Create secure default admin (bcrypt)
-        hashed_password = bcrypt.hashpw("admin123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-        users_df = pd.DataFrame([{
-            'ID': 1,
-            'Name': 'Admin User',
-            'Username': 'admin',
-            'Password': hashed_password,
-            'Role': 'Admin',
-            'Active': True,
-            'Assigned_Section': '',
-            'Assigned_Shift': ''
-        }])
-        write_table("users", users_df)
-
-    if read_table("workers").empty:
-        write_table("workers", pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active']))
-
-    if read_table("attendance").empty:
-        write_table("attendance", pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp']))
-
-# ==================== MOBILE RESPONSIVENESS ====================
-def mobile_responsive_css():
-    return """
-    <style>
-    @media (max-width: 768px) {
-        .main .block-container {
-            padding-left: 1rem;
-            padding-right: 1rem;
-            max-width: 100%;
-        }
-        div[data-testid="stHorizontalBlock"] > div { width: 100% !important; margin-bottom: 1rem; }
-        .stDataFrame { overflow-x: auto; display: block; white-space: nowrap; }
-        .stTextInput, .stSelectbox, .stDateInput, .stTimeInput, .stNumberInput { margin-bottom: 1rem; }
-        .stButton > button { width: 100%; margin-bottom: 0.5rem; }
-        .stRadio > div { flex-direction: column; }
-        .stRadio > div > label { margin-bottom: 0.5rem; }
-        .streamlit-expanderHeader { font-size: 1rem; padding: 0.5rem 0; }
-        div[data-testid="stMetric"] { margin-bottom: 1rem; }
-        .stTabs > div > div > div > button { font-size: 0.8rem; padding: 0.5rem; }
-    }
-    .attendance-grid { font-size: 0.9rem; }
-    .attendance-grid th { text-align: center; background-color: #f0f2f6; position: sticky; top: 0; }
-    .attendance-grid td { text-align: center; }
-    .present { color: green; font-weight: bold; }
-    .absent { color: red; font-weight: bold; }
-    .other-status { color: orange; }
-    </style>
-    """
-
-# ==================== UTILITIES ====================
-def normalize_active_column(df, col='Active'):
-    if col not in df.columns:
-        df[col] = True
-    df[col] = df[col].astype(str).str.strip().str.upper()
-    return df
-
-def dataframe_to_excel_bytes(df: pd.DataFrame):
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
-    bio.seek(0)
-    return bio
-
-def worker_template_excel_bytes():
-    """Generate a blank workers Excel template with required columns."""
-    template = pd.DataFrame(columns=["Name", "Section", "Department", "Shift", "Active"])
-    return dataframe_to_excel_bytes(template)
-
-def generate_attendance_grid(year, month):
-    """Generate attendance grid for the selected month and year."""
-    workers_df = read_table("workers")
-
-    # Ensure columns
-    for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-        if c not in workers_df.columns:
-            workers_df[c] = default
-
-    active_workers = workers_df.copy()
-    active_workers["Active"] = active_workers["Active"].astype(str)
-    active_workers = active_workers[active_workers["Active"].str.lower().isin(["true", "1", "yes"])]
-
-    if active_workers.empty:
-        return pd.DataFrame()
-
-    attendance_df = read_table("attendance")
-    if attendance_df.empty or "Date" not in attendance_df.columns:
-        return pd.DataFrame()
-
-    attendance_df["Date"] = pd.to_datetime(attendance_df["Date"])
-    monthly_attendance = attendance_df[
-        (attendance_df["Date"].dt.year == year) &
-        (attendance_df["Date"].dt.month == month)
-    ]
-
-    days_in_month = calendar.monthrange(year, month)[1]
-
-    grid_df = active_workers[["Name", "Section", "Department", "Shift"]].copy()
-    for day in range(1, days_in_month + 1):
-        grid_df[str(day)] = ""
-
-    for _, att in monthly_attendance.iterrows():
-        worker_name = att["Worker_Name"]
-        day = att["Date"].day
-        status = att["Status"]
-        idx = grid_df[grid_df["Name"] == worker_name].index
-        if not idx.empty:
-            if status == "Present":
-                grid_df.at[idx[0], str(day)] = "✓"
-            elif status == "Absent":
-                grid_df.at[idx[0], str(day)] = "✗"
-            else:
-                grid_df.at[idx[0], str(day)] = status[:1] if status else ""
-
-    present_counts = []
-    percentages = []
-    for _, worker in grid_df.iterrows():
-        present_count = sum(1 for d in range(1, days_in_month + 1) if worker[str(d)] == "✓")
-        present_counts.append(present_count)
-        percentages.append(round((present_count / days_in_month) * 100, 1))
-
-    grid_df["Present Days"] = present_counts
-    grid_df["Attendance %"] = percentages
-    return grid_df
-
-# ==================== AUTH ====================
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    try:
-        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
     except Exception:
         return False
 
-def login(username: str, password: str) -> bool:
-    engine = get_db_connection()
-    if engine is None:
+def get_online_engine_or_none():
+    if not SUPABASE_URL:
+        return None
+    eng = get_engine(SUPABASE_URL)
+    return eng if _try_ping(eng) else None
+
+def get_offline_engine():
+    eng = get_engine(SQLITE_URL)
+    # touch/connect
+    try:
+        with eng.connect() as _:
+            pass
+    except Exception:
+        pass
+    return eng
+
+def is_online() -> bool:
+    e = get_online_engine_or_none()
+    return e is not None
+
+# ==========================================================
+# DB INIT (public schema for both stores)
+# ==========================================================
+
+PG_TABLES = [
+    """CREATE TABLE IF NOT EXISTS shifts (
+        ID SERIAL PRIMARY KEY,
+        Name VARCHAR(255) NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS sections (
+        ID SERIAL PRIMARY KEY,
+        Name VARCHAR(255) NOT NULL,
+        Description VARCHAR(500)
+    )""",
+    """CREATE TABLE IF NOT EXISTS departments (
+        ID SERIAL PRIMARY KEY,
+        Name VARCHAR(255) NOT NULL,
+        Section_ID INTEGER,
+        Description VARCHAR(500)
+    )""",
+    """CREATE TABLE IF NOT EXISTS users (
+        ID SERIAL PRIMARY KEY,
+        Name VARCHAR(255) NOT NULL,
+        Username VARCHAR(255) UNIQUE NOT NULL,
+        Password VARCHAR(255) NOT NULL,
+        Role VARCHAR(50) NOT NULL,
+        Active BOOLEAN DEFAULT TRUE,
+        Assigned_Section VARCHAR(255),
+        Assigned_Shift VARCHAR(255)
+    )""",
+    """CREATE TABLE IF NOT EXISTS workers (
+        ID SERIAL PRIMARY KEY,
+        Name VARCHAR(255) NOT NULL,
+        Section VARCHAR(255),
+        Department VARCHAR(255),
+        Shift VARCHAR(255),
+        Active BOOLEAN DEFAULT TRUE
+    )""",
+    """CREATE TABLE IF NOT EXISTS attendance (
+        ID SERIAL PRIMARY KEY,
+        Worker_ID INTEGER,
+        Worker_Name VARCHAR(255) NOT NULL,
+        Date DATE NOT NULL,
+        Section VARCHAR(255),
+        Department VARCHAR(255),
+        Shift VARCHAR(255),
+        Status VARCHAR(50) NOT NULL,
+        Timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )"""
+]
+
+SQLITE_TABLES = [
+    """CREATE TABLE IF NOT EXISTS shifts (
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Name TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS sections (
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Name TEXT NOT NULL,
+        Description TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS departments (
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Name TEXT NOT NULL,
+        Section_ID INTEGER,
+        Description TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS users (
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Name TEXT NOT NULL,
+        Username TEXT UNIQUE NOT NULL,
+        Password TEXT NOT NULL,
+        Role TEXT NOT NULL,
+        Active INTEGER DEFAULT 1,
+        Assigned_Section TEXT,
+        Assigned_Shift TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS workers (
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Name TEXT NOT NULL,
+        Section TEXT,
+        Department TEXT,
+        Shift TEXT,
+        Active INTEGER DEFAULT 1
+    )""",
+    """CREATE TABLE IF NOT EXISTS attendance (
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Worker_ID INTEGER,
+        Worker_Name TEXT NOT NULL,
+        Date TEXT NOT NULL,
+        Section TEXT,
+        Department TEXT,
+        Shift TEXT,
+        Status TEXT NOT NULL,
+        Timestamp TEXT DEFAULT (datetime('now'))
+    )"""
+]
+
+def initialize_databases():
+    # Always init SQLite
+    off = get_offline_engine()
+    with off.begin() as conn:
+        for sql in SQLITE_TABLES:
+            conn.execute(text(sql))
+
+    # Init Postgres if online
+    on = get_online_engine_or_none()
+    if on:
+        with on.begin() as conn:
+            for sql in PG_TABLES:
+                conn.execute(text(sql))
+
+def seed_defaults(engine):
+    # shifts
+    rows = engine.execute(text("SELECT COUNT(*) FROM shifts")).scalar()
+    if rows == 0:
+        engine.execute(text("INSERT INTO shifts (Name) VALUES ('Morning'), ('Afternoon'), ('General')"))
+    # sections
+    rows = engine.execute(text("SELECT COUNT(*) FROM sections")).scalar()
+    if rows == 0:
+        engine.execute(text("""
+            INSERT INTO sections (Name, Description) VALUES
+            ('Liquid Section','Liquid manufacturing'),
+            ('Solid Section','Solid manufacturing'),
+            ('Utility Section','Utility services')
+        """))
+    # departments
+    rows = engine.execute(text("SELECT COUNT(*) FROM departments")).scalar()
+    if rows == 0:
+        engine.execute(text("""
+            INSERT INTO departments (Name, Section_ID, Description) VALUES
+            ('Mixing', 1, 'Mixing dept'),
+            ('Filling', 1, 'Filling dept'),
+            ('Packaging', 2, 'Packaging dept'),
+            ('Maintenance', 3, 'Maintenance dept')
+        """))
+    # users (default admin)
+    rows = engine.execute(text("SELECT COUNT(*) FROM users")).scalar()
+    if rows == 0:
+        hashed = bcrypt.hashpw("admin123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        engine.execute(
+            text("""INSERT INTO users (Name, Username, Password, Role, Active, Assigned_Section, Assigned_Shift)
+                    VALUES (:n, :u, :p, :r, :a, :s, :sh)"""),
+            {"n":"Admin User","u":"admin","p":hashed,"r":"Admin","a":True,"s":"","sh":""}
+        )
+
+def ensure_seed_data():
+    # seed offline DB
+    off = get_offline_engine()
+    with off.begin() as conn:
+        seed_defaults(conn)
+    # seed online if possible
+    on = get_online_engine_or_none()
+    if on:
+        with on.begin() as conn:
+            seed_defaults(conn)
+
+# ==========================================================
+# READ/WRITE helpers (auto select engine)
+# ==========================================================
+
+def current_engine():
+    return get_online_engine_or_none() or get_offline_engine()
+
+def read_table(table):
+    eng = current_engine()
+    try:
+        return pd.read_sql(f"SELECT * FROM {table}", eng)
+    except Exception:
+        return pd.DataFrame()
+
+def write_table_replace(table, df: pd.DataFrame) -> bool:
+    eng = current_engine()
+    try:
+        df.to_sql(table, eng, if_exists="replace", index=False)
+        return True
+    except Exception as e:
+        st.error(f"Write error ({table}): {e}")
         return False
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT ID, Password, Role, Active FROM attendance.users WHERE Username = :u"),
-            {"u": username}
-        ).fetchone()
-        if result:
-            uid, stored_hash, role, active = result
-            if active and verify_password(password, stored_hash):
-                st.session_state["logged_in"] = True
-                st.session_state["username"] = username
-                st.session_state["role"] = role
-                st.session_state["user_id"] = uid
-                return True
+
+# ==========================================================
+# OFFLINE → ONLINE SYNC (simple, best-effort)
+# ==========================================================
+
+def sync_from_sqlite_to_supabase():
+    """Push new workers & attendance from SQLite to Supabase when we come online."""
+    on = get_online_engine_or_none()
+    if not on:
+        return 0, 0
+
+    off = get_offline_engine()
+    new_workers = 0
+    new_att = 0
+    try:
+        off_workers = pd.read_sql("SELECT Name,Section,Department,Shift,Active FROM workers", off)
+        on_workers = pd.read_sql("SELECT Name,Section,Department,Shift,Active FROM workers", on)
+        # dedupe key: Name+Section+Department+Shift
+        if not off_workers.empty:
+            merged = off_workers.merge(
+                on_workers, how="left",
+                on=["Name","Section","Department","Shift"],
+                indicator=True, suffixes=("","_on")
+            )
+            to_add = merged[merged["_merge"] == "left_only"][["Name","Section","Department","Shift","Active"]]
+            if not to_add.empty:
+                # normalize Active to bool for PG
+                to_add["Active"] = to_add["Active"].apply(lambda x: bool(int(x)) if str(x).isdigit() else (str(x).lower() in ["true","1","yes"]))
+                with on.begin() as conn:
+                    for _, r in to_add.iterrows():
+                        conn.execute(text("""INSERT INTO workers (Name,Section,Department,Shift,Active)
+                                             VALUES (:n,:s,:d,:sh,:a)"""),
+                                     {"n":r["Name"],"s":r["Section"],"d":r["Department"],"sh":r["Shift"],"a":bool(r["Active"])})
+                new_workers = len(to_add)
+
+        off_att = pd.read_sql("SELECT Worker_ID,Worker_Name,Date,Section,Department,Shift,Status,Timestamp FROM attendance", off)
+        on_att = pd.read_sql("SELECT Worker_Name,Date FROM attendance", on)
+        if not off_att.empty:
+            # normalize date to yyyy-mm-dd
+            off_att["Date"] = pd.to_datetime(off_att["Date"]).dt.date.astype(str)
+            on_att["Date"] = pd.to_datetime(on_att["Date"]).dt.date.astype(str)
+            merged = off_att.merge(on_att, how="left", on=["Worker_Name","Date"], indicator=True)
+            to_add = merged[merged["_merge"] == "left_only"][["Worker_ID","Worker_Name","Date","Section","Department","Shift","Status","Timestamp"]]
+            if not to_add.empty:
+                with on.begin() as conn:
+                    for _, r in to_add.iterrows():
+                        conn.execute(text("""INSERT INTO attendance
+                            (Worker_ID,Worker_Name,Date,Section,Department,Shift,Status,Timestamp)
+                            VALUES (:wid,:wn,:dt,:s,:d,:sh,:st,:ts)"""),
+                            {"wid":int(r["Worker_ID"]) if pd.notna(r["Worker_ID"]) else None,
+                             "wn":r["Worker_Name"],"dt":r["Date"],"s":r["Section"],
+                             "d":r["Department"],"sh":r["Shift"],"st":r["Status"],
+                             "ts":r["Timestamp"] if pd.notna(r["Timestamp"]) else datetime.datetime.now()})
+                new_att = len(to_add)
+    except Exception as e:
+        st.warning(f"Sync note: {e}")
+
+    return new_workers, new_att
+
+# ==========================================================
+# UTILITIES
+# ==========================================================
+
+def mobile_css():
+    return """
+    <style>
+    @media (max-width: 768px) {
+      .main .block-container { padding: 1rem; }
+      .stButton > button { width: 100%; }
+      .stDataFrame { overflow-x: auto; }
+      .stTabs [data-baseweb="tab-list"] { flex-wrap: wrap; }
+    }
+    .attendance-grid th { position: sticky; top: 0; background: #f6f7fb; }
+    .attendance-grid td, .attendance-grid th { text-align: center; }
+    </style>
+    """
+
+def dataframe_to_excel_bytes(df: pd.DataFrame):
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
+    bio.seek(0)
+    return bio
+
+def worker_template_bytes():
+    cols = ["Name","Section","Department","Shift","Active"]
+    return dataframe_to_excel_bytes(pd.DataFrame(columns=cols))
+
+def verify_password(plain, hashed) -> bool:
+    try: return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception: return False
+
+def generate_attendance_grid(year, month):
+    workers = read_table("workers")
+    att = read_table("attendance")
+    if workers.empty or att.empty: return pd.DataFrame()
+    for c in ["Active","Section","Department","Shift"]:
+        if c not in workers.columns: workers[c] = "" if c != "Active" else True
+    att["Date"] = pd.to_datetime(att["Date"])
+    att_m = att[(att["Date"].dt.year==year)&(att["Date"].dt.month==month)]
+    if att_m.empty: return pd.DataFrame()
+
+    days = calendar.monthrange(year, month)[1]
+    g = workers[["ID","Name","Section","Department","Shift"]].copy()
+    for d in range(1, days+1): g[str(d)] = ""
+    for _, r in att_m.iterrows():
+        name = r["Worker_Name"]; d = int(r["Date"].day); s = r["Status"]
+        idx = g[g["Name"]==name].index
+        if not idx.empty:
+            g.at[idx[0], str(d)] = "✓" if s=="Present" else ("✗" if s=="Absent" else s[:1])
+    pres = []; perc=[]
+    for _, row in g.iterrows():
+        p = sum(1 for d in range(1,days+1) if row[str(d)]=="✓")
+        pres.append(p); perc.append(round(p/days*100,1))
+    g["Present Days"] = pres; g["Attendance %"] = perc
+    return g
+
+# ==========================================================
+# AUTH
+# ==========================================================
+
+def login(username, password) -> bool:
+    eng = current_engine()
+    with eng.connect() as conn:
+        res = conn.execute(text("SELECT ID, Password, Role, Active FROM users WHERE Username=:u"), {"u":username}).fetchone()
+    if not res: return False
+    uid, phash, role, active = res
+    if not active: return False
+    if verify_password(password, phash):
+        st.session_state["logged_in"]=True
+        st.session_state["username"]=username
+        st.session_state["role"]=role
+        st.session_state["user_id"]=uid
+        return True
     return False
 
 def logout():
     st.session_state.clear()
 
-# ==================== LOGIN PAGE ====================
+# ==========================================================
+# PAGES — Admin / Supervisor / HR
+# ==========================================================
+
+def admin_dashboard():
+    st.title("🔧 Admin Dashboard")
+    tabs = st.tabs(["👥 Users","🏭 Sections","🏢 Departments","👷 Workers","📊 Attendance","🗑️ Delete Data"])
+
+    # USERS
+    with tabs[0]:
+        st.subheader("User Management")
+        df = read_table("users")
+        colA, colB = st.columns([1.2,2])
+        with colA:
+            st.markdown("#### ➕ Add User")
+            with st.form("add_user"):
+                name = st.text_input("Full Name")
+                uname = st.text_input("Username")
+                pwd = st.text_input("Password", type="password")
+                role = st.selectbox("Role", ["Admin","Supervisor","HR"])
+                asec = st.text_input("Assigned Section (optional)")
+                ashi = st.text_input("Assigned Shift (optional)")
+                if st.form_submit_button("Add"):
+                    if name and uname and pwd:
+                        hashed = bcrypt.hashpw(pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+                        next_id = int(df["ID"].max())+1 if (not df.empty and "ID" in df.columns) else 1
+                        row = pd.DataFrame([{"ID":next_id,"Name":name,"Username":uname,"Password":hashed,
+                                            "Role":role,"Active":True,"Assigned_Section":asec,"Assigned_Shift":ashi}])
+                        df = pd.concat([df, row], ignore_index=True)
+                        if write_table_replace("users", df): st.success("User added"); st.rerun()
+                    else:
+                        st.error("Fill all fields")
+        with colB:
+            st.markdown("#### 📋 Users")
+            if df.empty: st.info("No users"); 
+            else:
+                st.dataframe(df[["ID","Name","Username","Role","Active","Assigned_Section","Assigned_Shift"]], use_container_width=True)
+
+    # SECTIONS
+    with tabs[1]:
+        st.subheader("Sections")
+        df = read_table("sections")
+        colA, colB = st.columns([1.2,2])
+        with colA:
+            with st.form("add_section"):
+                n = st.text_input("Section Name")
+                d = st.text_area("Description")
+                if st.form_submit_button("Add Section"):
+                    if n:
+                        next_id = int(df["ID"].max())+1 if (not df.empty and "ID" in df.columns) else 1
+                        row = pd.DataFrame([{"ID":next_id,"Name":n,"Description":d}])
+                        out = pd.concat([df, row], ignore_index=True)
+                        if write_table_replace("sections", out): st.success("Added"); st.rerun()
+                    else: st.error("Enter name")
+        with colB:
+            st.dataframe(df, use_container_width=True)
+
+    # DEPARTMENTS
+    with tabs[2]:
+        st.subheader("Departments")
+        secs = read_table("sections")
+        df = read_table("departments")
+        colA, colB = st.columns([1.2,2])
+        with colA:
+            with st.form("add_dept"):
+                n = st.text_input("Department Name")
+                sec_id = st.selectbox("Section", secs["ID"].tolist() if not secs.empty else [])
+                d = st.text_area("Description")
+                if st.form_submit_button("Add Department"):
+                    if n and sec_id:
+                        next_id = int(df["ID"].max())+1 if (not df.empty and "ID" in df.columns) else 1
+                        row = pd.DataFrame([{"ID":next_id,"Name":n,"Section_ID":sec_id,"Description":d}])
+                        out = pd.concat([df,row], ignore_index=True)
+                        if write_table_replace("departments", out): st.success("Added"); st.rerun()
+                    else: st.error("Enter name & section")
+        with colB:
+            if df.empty: st.info("No departments")
+            else:
+                merged = df.merge(secs[["ID","Name"]], left_on="Section_ID", right_on="ID", how="left", suffixes=("","_sec"))
+                merged = merged.rename(columns={"Name":"Department","Name_sec":"Section"}).drop(columns=["ID_sec"])
+                st.dataframe(merged[["ID","Department","Section","Description"]], use_container_width=True)
+
+    # WORKERS
+    with tabs[3]:
+        st.subheader("Workers")
+        secs = read_table("sections"); depts = read_table("departments"); shf = read_table("shifts")
+        wdf = read_table("workers")
+        for c, default in [("Active",True),("Section",""),("Department",""),("Shift","")]:
+            if c not in wdf.columns: wdf[c]=default
+
+        colL, colR = st.columns([1.2,2])
+        with colL:
+            st.download_button("⬇️ Workers Template", data=worker_template_bytes(),
+                               file_name="workers_template.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            up = st.file_uploader("Upload Workers (Excel/CSV)", type=["xlsx","csv"])
+            if up:
+                try:
+                    newdf = pd.read_excel(up) if up.name.endswith(".xlsx") else pd.read_csv(up)
+                    need = {"Name","Section","Department","Shift"}
+                    if not need.issubset(set(newdf.columns)): st.error(f"Missing columns. Need: {', '.join(sorted(need))}")
+                    else:
+                        def dup(r):
+                            return ((wdf["Name"]==r["Name"])&(wdf["Section"]==r["Section"])&
+                                    (wdf["Department"]==r["Department"])&(wdf["Shift"]==r["Shift"])).any()
+                        nxt = int(wdf["ID"].max())+1 if (not wdf.empty and "ID" in wdf.columns) else 1
+                        adds=[]
+                        for _, r in newdf.iterrows():
+                            if not dup(r):
+                                adds.append({"ID":nxt,"Name":str(r["Name"]).strip(),"Section":str(r["Section"]).strip(),
+                                             "Department":str(r["Department"]).strip(),"Shift":str(r["Shift"]).strip(),
+                                             "Active":True})
+                                nxt+=1
+                        if adds:
+                            out = pd.concat([wdf, pd.DataFrame(adds)], ignore_index=True)
+                            if write_table_replace("workers", out): st.success(f"Added {len(adds)}"); st.rerun()
+                        else:
+                            st.info("No new workers to add.")
+                except Exception as e:
+                    st.error(f"Read error: {e}")
+
+            st.markdown("#### ➕ Add Single Worker")
+            with st.form("add_single_worker"):
+                nm = st.text_input("Name")
+                sec = st.selectbox("Section", secs["Name"].tolist() if not secs.empty else [])
+                if sec and not secs.empty:
+                    sec_id = secs[secs["Name"]==sec]["ID"].values[0]
+                    dept_opts = depts[depts["Section_ID"]==sec_id]["Name"].tolist() if not depts.empty else []
+                else:
+                    dept_opts=[]
+                dep = st.selectbox("Department", dept_opts)
+                shi = st.selectbox("Shift", shf["Name"].tolist() if not shf.empty else [])
+                if st.form_submit_button("Add"):
+                    if nm and sec and dep and shi:
+                        nxt = int(wdf["ID"].max())+1 if (not wdf.empty and "ID" in wdf.columns) else 1
+                        row = pd.DataFrame([{"ID":nxt,"Name":nm,"Section":sec,"Department":dep,"Shift":shi,"Active":True}])
+                        out = pd.concat([wdf,row], ignore_index=True)
+                        if write_table_replace("workers", out): st.success("Added"); st.rerun()
+                    else: st.error("Fill all fields")
+
+        with colR:
+            st.write(f"**Total workers:** {len(wdf)}")
+            st.download_button("📥 Download Workers", data=dataframe_to_excel_bytes(wdf),
+                               file_name="workers.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.dataframe(wdf, use_container_width=True)
+
+    # ATTENDANCE (view)
+    with tabs[4]:
+        st.subheader("Attendance Records")
+        att = read_table("attendance")
+        if not att.empty and "Date" in att.columns:
+            att["Date"] = pd.to_datetime(att["Date"]).dt.date
+            d = st.date_input("Date", datetime.date.today())
+            f = att[att["Date"]==d]
+            if not f.empty:
+                st.dataframe(f[["Worker_Name","Section","Department","Shift","Status","Timestamp"]], use_container_width=True)
+                tot=len(f); p=(f["Status"]=="Present").sum(); a=(f["Status"]=="Absent").sum()
+                l=(f["Status"]=="Late").sum(); le=(f["Status"]=="Leave").sum()
+                c1,c2,c3,c4=st.columns(4)
+                with c1: st.metric("Present", p, f"{p/tot*100:.1f}%")
+                with c2: st.metric("Absent", a, f"{a/tot*100:.1f}%")
+                with c3: st.metric("Late", l, f"{l/tot*100:.1f}%")
+                with c4: st.metric("Leave", le, f"{le/tot*100:.1f}%")
+            else: st.info("No records for that date.")
+        else: st.info("No attendance yet.")
+
+    # DELETE DATA
+    with tabs[5]:
+        st.warning("Danger Zone")
+        if st.button("Clear Attendance"):
+            write_table_replace("attendance", pd.DataFrame(columns=["ID","Worker_ID","Worker_Name","Date","Section","Department","Shift","Status","Timestamp"]))
+            st.success("Cleared")
+        if st.button("Clear Workers"):
+            write_table_replace("workers", pd.DataFrame(columns=["ID","Name","Section","Department","Shift","Active"]))
+            st.success("Cleared")
+
+def supervisor_dashboard():
+    st.title("👷 Supervisor Dashboard")
+    tabs = st.tabs(["✅ Mark Attendance","📊 Register","🔄 Transfer Workers","👥 Manage Workers","📅 View Attendance","📊 Monthly Grid"])
+    secs = read_table("sections"); depts = read_table("departments"); shf = read_table("shifts")
+    wdf = read_table("workers")
+    for c, d in [("Active",True),("Section",""),("Department",""),("Shift","")]:
+        if c not in wdf.columns: wdf[c]=d
+
+    # MARK
+    with tabs[0]:
+        st.subheader("Mark Attendance")
+        mark_date = st.date_input("Date", datetime.date.today())
+        col1, col2 = st.columns(2)
+        with col1:
+            sec = st.selectbox("Section", ["All"]+(secs["Name"].tolist() if not secs.empty else []))
+            if sec!="All" and not secs.empty:
+                sid = secs[secs["Name"]==sec]["ID"].values[0]
+                dept_opts = depts[depts["Section_ID"]==sid]["Name"].tolist() if not depts.empty else []
+            else:
+                dept_opts=["All"]
+            dep = st.selectbox("Department", dept_opts)
+        with col2:
+            shi = st.selectbox("Shift", ["All"]+(shf["Name"].tolist() if not shf.empty else []))
+
+        active = wdf[wdf["Active"].astype(str).str.lower().isin(["true","1","yes"])]
+        if sec!="All": active=active[active["Section"]==sec]
+        if dep!="All": active=active[active["Department"]==dep]
+        if shi!="All": active=active[active["Shift"]==shi]
+
+        if active.empty:
+            st.info("No active workers for selected filters.")
+        else:
+            att = read_table("attendance")
+            if not att.empty and "Date" in att.columns:
+                att["Date"]=pd.to_datetime(att["Date"]).dt.date
+                existing = att[(att["Date"]==mark_date)&(att["Worker_ID"].astype(str).isin(active["ID"].astype(str)))]
+            else:
+                existing = pd.DataFrame()
+            statuses={}
+            with st.form("mark_form"):
+                for _, r in active.iterrows():
+                    default = 0
+                    if not existing.empty:
+                        row = existing[existing["Worker_ID"].astype(str)==str(r["ID"])]
+                        if not row.empty and "Status" in row.columns:
+                            s=row.iloc[0]["Status"]
+                            default = ["Present","Absent","Late","Leave"].index(s) if s in ["Present","Absent","Late","Leave"] else 0
+                    st.write(f"**{r['Name']}** — {r['Section']}/{r['Department']}/{r['Shift']}")
+                    s = st.radio("Status", ["Present","Absent","Late","Leave"], index=default, horizontal=True, label_visibility="collapsed", key=f"stat_{r['ID']}")
+                    statuses[int(r["ID"])]={
+                        "name":r["Name"],"section":r["Section"],"department":r["Department"],"shift":r["Shift"],"status":s
+                    }
+                if st.form_submit_button("Save"):
+                    att_df = read_table("attendance")
+                    if att_df.empty:
+                        att_df = pd.DataFrame(columns=["ID","Worker_ID","Worker_Name","Date","Section","Department","Shift","Status","Timestamp"])
+                    next_id = int(att_df["ID"].max())+1 if (not att_df.empty and "ID" in att_df.columns) else 1
+                    dstr = mark_date.strftime("%Y-%m-%d")
+                    new_rows=[]
+                    for wid, info in statuses.items():
+                        if not existing.empty:
+                            ex = existing[existing["Worker_ID"].astype(str)==str(wid)]
+                            if not ex.empty:
+                                rid = ex.iloc[0]["ID"]
+                                att_df.loc[att_df["ID"]==rid, "Status"]=info["status"]
+                                att_df.loc[att_df["ID"]==rid, "Timestamp"]=datetime.datetime.now()
+                            else:
+                                new_rows.append({"ID":next_id,"Worker_ID":wid,"Worker_Name":info["name"],"Date":dstr,
+                                                 "Section":info["section"],"Department":info["department"],"Shift":info["shift"],
+                                                 "Status":info["status"],"Timestamp":datetime.datetime.now()})
+                                next_id+=1
+                        else:
+                            new_rows.append({"ID":next_id,"Worker_ID":wid,"Worker_Name":info["name"],"Date":dstr,
+                                             "Section":info["section"],"Department":info["department"],"Shift":info["shift"],
+                                             "Status":info["status"],"Timestamp":datetime.datetime.now()})
+                            next_id+=1
+                    if new_rows:
+                        att_df = pd.concat([att_df, pd.DataFrame(new_rows)], ignore_index=True)
+                    if write_table_replace("attendance", att_df):
+                        st.success("Attendance saved"); st.rerun()
+
+    # REGISTER
+    with tabs[1]:
+        st.subheader("Attendance Register")
+        d = st.date_input("Date", datetime.date.today())
+        sec = st.selectbox("Section", ["All"]+(secs["Name"].tolist() if not secs.empty else []), key="reg_sec")
+        if sec!="All" and not secs.empty:
+            sid = secs[secs["Name"]==sec]["ID"].values[0]
+            dept_opts = depts[depts["Section_ID"]==sid]["Name"].tolist() if not depts.empty else []
+        else:
+            dept_opts=["All"]
+        dep = st.selectbox("Department", dept_opts, key="reg_dep")
+        shi = st.selectbox("Shift", ["All"]+(shf["Name"].tolist() if not shf.empty else []), key="reg_shi")
+        att = read_table("attendance")
+        if not att.empty and "Date" in att.columns:
+            att["Date"]=pd.to_datetime(att["Date"]).dt.date
+            f = att[att["Date"]==d]
+            if sec!="All": f=f[f["Section"]==sec]
+            if dep!="All": f=f[f["Department"]==dep]
+            if shi!="All": f=f[f["Shift"]==shi]
+            if not f.empty:
+                st.dataframe(f[["Worker_Name","Section","Department","Shift","Status","Timestamp"]], use_container_width=True)
+                tot=len(f); p=(f["Status"]=="Present").sum(); a=(f["Status"]=="Absent").sum()
+                l=(f["Status"]=="Late").sum(); le=(f["Status"]=="Leave").sum()
+                c1,c2,c3,c4=st.columns(4)
+                with c1: st.metric("Present", p, f"{p/tot*100:.1f}%")
+                with c2: st.metric("Absent", a, f"{a/tot*100:.1f}%")
+                with c3: st.metric("Late", l, f"{l/tot*100:.1f}%")
+                with c4: st.metric("Leave", le, f"{le/tot*100:.1f}%")
+                st.download_button("📥 Download CSV", data=f.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"attendance_{d}.csv", mime="text/csv")
+            else: st.info("No records for filters.")
+        else: st.info("No attendance yet.")
+
+    # TRANSFER
+    with tabs[2]:
+        st.subheader("Transfer Workers")
+        w = read_table("workers")
+        if w.empty: st.info("No workers"); 
+        else:
+            act = w[w["Active"].astype(str).str.lower().isin(["true","1","yes"])]
+            if act.empty: st.info("No active workers")
+            else:
+                name = st.selectbox("Worker", act["Name"].tolist())
+                row = act[act["Name"]==name].iloc[0]
+                st.write(f"Current: {row['Section']} / {row['Department']} — {row['Shift']}")
+                ns = st.selectbox("New Section", secs["Name"].tolist() if not secs.empty else [])
+                if ns and not secs.empty:
+                    sid = secs[secs["Name"]==ns]["ID"].values[0]
+                    nd = depts[depts["Section_ID"]==sid]["Name"].tolist() if not depts.empty else []
+                else:
+                    nd=[]
+                ndp = st.selectbox("New Department", nd)
+                nsh = st.selectbox("New Shift", shf["Name"].tolist() if not shf.empty else [])
+                if st.button("Transfer"):
+                    w.loc[w["ID"]==row["ID"], ["Section","Department","Shift"]] = [ns, ndp, nsh]
+                    if write_table_replace("workers", w): st.success("Transferred"); st.rerun()
+
+    # Manage workers (quick activate/deactivate/delete)
+    with tabs[3]:
+        st.subheader("Manage Workers")
+        w = read_table("workers")
+        if w.empty: st.info("No workers")
+        else:
+            for _, r in w.iterrows():
+                tag = "✅" if str(r["Active"]).lower() in ["true","1","yes"] else "❌"
+                with st.expander(f"{tag} {r['Name']} — {r['Section']}/{r['Department']} ({r['Shift']})"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        togg = st.button("Deactivate" if tag=="✅" else "Activate", key=f"toggle_{r['ID']}")
+                        if togg:
+                            w.loc[w["ID"]==r["ID"], "Active"] = not (tag=="✅")
+                            if write_table_replace("workers", w): st.rerun()
+                    with col2:
+                        if st.button("🗑️ Delete", key=f"del_{r['ID']}"):
+                            w2 = w[w["ID"]!=r["ID"]]
+                            if write_table_replace("workers", w2): st.rerun()
+
+    # View attendance
+    with tabs[4]:
+        st.subheader("View Attendance")
+        att = read_table("attendance")
+        if not att.empty and "Date" in att.columns:
+            att["Date"]=pd.to_datetime(att["Date"]).dt.date
+            d = st.date_input("Date", datetime.date.today(), key="sv_view_d")
+            sec = st.selectbox("Section", ["All"]+(secs["Name"].tolist() if not secs.empty else []), key="sv_view_s")
+            if sec!="All" and not secs.empty:
+                sid = secs[secs["Name"]==sec]["ID"].values[0]
+                dept_opts = depts[depts["Section_ID"]==sid]["Name"].tolist() if not depts.empty else []
+            else:
+                dept_opts=["All"]
+            dep = st.selectbox("Department", dept_opts, key="sv_view_dp")
+            shi = st.selectbox("Shift", ["All"]+(shf["Name"].tolist() if not shf.empty else []), key="sv_view_sh")
+            f = att[att["Date"]==d]
+            if sec!="All": f=f[f["Section"]==sec]
+            if dep!="All": f=f[f["Department"]==dep]
+            if shi!="All": f=f[f["Shift"]==shi]
+            if not f.empty:
+                st.dataframe(f[["Worker_Name","Section","Department","Shift","Status","Timestamp"]], use_container_width=True)
+            else: st.info("No records for filters.")
+        else: st.info("No attendance yet.")
+
+    # Grid
+    with tabs[5]:
+        st.subheader("Monthly Attendance Grid")
+        col1, col2 = st.columns(2)
+        with col1:
+            year = st.selectbox("Year", list(range(2020, datetime.date.today().year+2)),
+                                index=list(range(2020, datetime.date.today().year+2)).index(datetime.date.today().year))
+        with col2:
+            month = st.selectbox("Month", list(range(1,13)), index=datetime.date.today().month-1)
+        g = generate_attendance_grid(year, month)
+        if g.empty: st.info("No data for period.")
+        else:
+            st.markdown('<div class="attendance-grid">', unsafe_allow_html=True)
+            st.dataframe(g, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.download_button("📥 Download Grid", data=dataframe_to_excel_bytes(g),
+                               file_name=f"attendance_grid_{year}_{month}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+def hr_dashboard():
+    st.title("📊 HR Dashboard")
+    tabs = st.tabs(["📊 Daily","📅 Monthly","👥 Directory","📊 Monthly Grid"])
+    workers = read_table("workers")
+    att = read_table("attendance")
+
+    # Daily
+    with tabs[0]:
+        st.subheader("Daily")
+        if not att.empty and "Date" in att.columns:
+            att["Date"]=pd.to_datetime(att["Date"]).dt.date
+            d = st.date_input("Date", datetime.date.today(), key="hr_d")
+            f = att[att["Date"]==d]
+            if not f.empty:
+                st.dataframe(f[["Worker_Name","Section","Department","Shift","Status","Timestamp"]], use_container_width=True)
+                tot=len(f); p=(f["Status"]=="Present").sum(); a=(f["Status"]=="Absent").sum()
+                l=(f["Status"]=="Late").sum(); le=(f["Status"]=="Leave").sum()
+                c1,c2,c3,c4=st.columns(4)
+                with c1: st.metric("Present", p, f"{p/tot*100:.1f}%")
+                with c2: st.metric("Absent", a, f"{a/tot*100:.1f}%")
+                with c3: st.metric("Late", l, f"{l/tot*100:.1f}%")
+                with c4: st.metric("Leave", le, f"{le/tot*100:.1f}%")
+            else: st.info("No records for date.")
+        else: st.info("No attendance yet.")
+
+    # Monthly
+    with tabs[1]:
+        st.subheader("Monthly")
+        if not att.empty and "Date" in att.columns:
+            att["Date"]=pd.to_datetime(att["Date"])
+            year = st.selectbox("Year", list(range(2020, datetime.date.today().year+2)),
+                                index=list(range(2020, datetime.date.today().year+2)).index(datetime.date.today().year),
+                                key="hr_y")
+            month = st.selectbox("Month", list(range(1,13)), index=datetime.date.today().month-1, key="hr_m")
+            m = att[(att["Date"].dt.year==year)&(att["Date"].dt.month==month)]
+            if not m.empty:
+                stats = m.groupby("Worker_Name").agg(
+                    Present=("Status", lambda x: (x=="Present").sum()),
+                    Absent=("Status", lambda x: (x=="Absent").sum()),
+                    Late=("Status", lambda x: (x=="Late").sum()),
+                    Leave=("Status", lambda x: (x=="Leave").sum()),
+                    Total=("Status","count")
+                ).reset_index()
+                stats["Attendance %"] = (stats["Present"]/stats["Total"]*100).round(1)
+                details = workers[["Name","Section","Department","Shift"]] if not workers.empty else pd.DataFrame()
+                if not details.empty:
+                    stats = stats.merge(details, left_on="Worker_Name", right_on="Name", how="left").drop(columns=["Name"])
+                st.dataframe(stats, use_container_width=True)
+                st.download_button("📥 Download Monthly CSV", data=stats.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"monthly_{year}_{month}.csv", mime="text/csv")
+            else: st.info("No records for month.")
+        else: st.info("No attendance yet.")
+
+    # Directory
+    with tabs[2]:
+        st.subheader("Directory")
+        if workers.empty: st.info("No workers")
+        else:
+            workers["Active"]=workers["Active"].astype(str)
+            act = workers[workers["Active"].str.lower().isin(["true","1","yes"])]
+            st.dataframe(act[["Name","Section","Department","Shift"]], use_container_width=True)
+            st.download_button("📥 Download Directory", data=dataframe_to_excel_bytes(act[["Name","Section","Department","Shift"]]),
+                               file_name="worker_directory.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Grid
+    with tabs[3]:
+        st.subheader("Monthly Grid")
+        year = st.selectbox("Year", list(range(2020, datetime.date.today().year+2)),
+                            index=list(range(2020, datetime.date.today().year+2)).index(datetime.date.today().year),
+                            key="hrg_y")
+        month = st.selectbox("Month", list(range(1,13)), index=datetime.date.today().month-1, key="hrg_m")
+        g = generate_attendance_grid(year, month)
+        if g.empty: st.info("No data")
+        else:
+            st.markdown('<div class="attendance-grid">', unsafe_allow_html=True)
+            st.dataframe(g, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.download_button("📥 Download Grid", data=dataframe_to_excel_bytes(g),
+                               file_name=f"attendance_grid_{year}_{month}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ==========================================================
+# LOGIN PAGE
+# ==========================================================
+
 def login_page():
     st.title("🔐 Company Attendance System")
     st.markdown("---")
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
         st.subheader("Login")
-        username = st.text_input("Username", key="login_username")
-        password = st.text_input("Password", type="password", key="login_password")
-        if st.button("Login", type="primary", use_container_width=True):
-            if login(username, password):
-                st.success(f"Welcome, {username}!")
-                time.sleep(0.8)
-                st.rerun()
-            else:
-                st.error("Invalid credentials or account inactive")
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        if st.button("Login", use_container_width=True):
+            if login(u, p): st.success("Welcome!"); time.sleep(0.7); st.rerun()
+            else: st.error("Invalid credentials or inactive user")
 
-# ==================== ADMIN DASHBOARD ====================
-def admin_dashboard():
-    st.title("🔧 Admin Dashboard")
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["👥 Users", "🏭 Sections", "🏢 Departments", "👷 Workers", "📊 Attendance", "🗑️ Delete Data"]
-    )
+# ==========================================================
+# MAIN
+# ==========================================================
 
-    # ---- Users Tab ----
-    with tab1:
-        st.subheader("User Management")
-        users_df = read_table("users")
-
-        col_a, col_b = st.columns([2,3])
-        with col_a:
-            st.markdown("#### ➕ Add New User")
-            with st.form("add_user"):
-                name = st.text_input("Full Name")
-                username = st.text_input("Username")
-                password = st.text_input("Password", type="password")
-                role = st.selectbox("Role", ["Admin", "Supervisor", "HR"], key="admin_role")
-                assigned_section = st.text_input("Assigned Section (optional)")
-                assigned_shift = st.text_input("Assigned Shift (optional)")
-                if st.form_submit_button("Add User"):
-                    if name and username and password:
-                        df = read_table("users")
-                        new_id = int(df['ID'].max())+1 if not df.empty and 'ID' in df.columns else 1
-                        hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-                        new_user = pd.DataFrame([{
-                            'ID': new_id,
-                            'Name': name,
-                            'Username': username,
-                            'Password': hashed,       # store bcrypt hash
-                            'Role': role,
-                            'Active': True,
-                            'Assigned_Section': assigned_section,
-                            'Assigned_Shift': assigned_shift
-                        }])
-                        df = pd.concat([df, new_user], ignore_index=True)
-                        if write_table("users", df):
-                            st.success("User added")
-                            st.rerun()
-                    else:
-                        st.error("Please fill all fields")
-
-        with col_b:
-            st.markdown("#### 📋 All Users")
-            users_df = read_table("users")
-            if not users_df.empty:
-                users_df = normalize_active_column(users_df, 'Active')
-                for _, u in users_df.iterrows():
-                    label = f"{'✅' if u['Active']=='TRUE' else '❌'} {u['Name']} (@{u['Username']})"
-                    with st.expander(label):
-                        st.write(f"Role: {u['Role']}")
-                        st.write(f"ID: {u['ID']}")
-                        st.write(f"Assigned Section: {u.get('Assigned_Section','')}")
-                        st.write(f"Assigned Shift: {u.get('Assigned_Shift','')}")
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if u['Active']=='TRUE':
-                                if st.button("Deactivate", key=f"deact_{u['ID']}"):
-                                    df = read_table("users")
-                                    df.loc[df['ID']==u['ID'],'Active'] = False
-                                    write_table("users", df)
-                                    st.rerun()
-                            else:
-                                if st.button("Activate", key=f"act_{u['ID']}"):
-                                    df = read_table("users")
-                                    df.loc[df['ID']==u['ID'],'Active'] = True
-                                    write_table("users", df)
-                                    st.rerun()
-                        with col2:
-                            if u['ID'] != st.session_state.get('user_id'):
-                                if st.button("🗑️ Delete", key=f"del_{u['ID']}"):
-                                    df = read_table("users")
-                                    df = df[df['ID'] != u['ID']]
-                                    write_table("users", df)
-                                    st.rerun()
-            else:
-                st.info("No users found")
-
-    # ---- Sections Tab ----
-    with tab2:
-        st.subheader("Sections Management")
-        sections_df = read_table("sections")
-        col1, col2 = st.columns([2,3])
-        with col1:
-            st.markdown("#### ➕ Add Section")
-            with st.form("add_section"):
-                section_name = st.text_input("Section Name")
-                desc = st.text_area("Description")
-                if st.form_submit_button("Add Section"):
-                    if section_name:
-                        df = read_table("sections")
-                        new_id = int(df['ID'].max())+1 if not df.empty and 'ID' in df.columns else 1
-                        new_section = pd.DataFrame([{'ID':new_id,'Name':section_name,'Description':desc}])
-                        df = pd.concat([df, new_section], ignore_index=True)
-                        if write_table("sections", df):
-                            st.success("Section added")
-                            st.rerun()
-                    else:
-                        st.error("Enter section name")
-        with col2:
-            st.markdown("#### 📋 All Sections")
-            if not sections_df.empty:
-                st.dataframe(sections_df, use_container_width=True)
-            else:
-                st.info("No sections found")
-
-    # ---- Departments Tab ----
-    with tab3:
-        st.subheader("Departments Management")
-        sections_df = read_table("sections")
-        departments_df = read_table("departments")
-        col1, col2 = st.columns([2,3])
-        with col1:
-            st.markdown("#### ➕ Add Department")
-            with st.form("add_department"):
-                dept_name = st.text_input("Department Name")
-                section_id = st.selectbox("Section", sections_df['ID'].tolist() if not sections_df.empty else [], key="dept_section")
-                desc = st.text_area("Description")
-                if st.form_submit_button("Add Department"):
-                    if dept_name and section_id:
-                        df = read_table("departments")
-                        new_id = int(df['ID'].max())+1 if not df.empty and 'ID' in df.columns else 1
-                        new_department = pd.DataFrame([{'ID':new_id,'Name':dept_name,'Section_ID':section_id,'Description':desc}])
-                        df = pd.concat([df, new_department], ignore_index=True)
-                        if write_table("departments", df):
-                            st.success("Department added")
-                            st.rerun()
-                    else:
-                        st.error("Enter department name and select section")
-        with col2:
-            st.markdown("#### 📋 All Departments")
-            if not departments_df.empty:
-                merged = departments_df.merge(
-                    sections_df[['ID','Name']], left_on='Section_ID', right_on='ID', how='left', suffixes=('', '_section')
-                )
-                merged = merged.rename(columns={'Name':'Department','Name_section':'Section'})
-                merged = merged.drop(columns=['ID_section'])
-                st.dataframe(merged[['ID','Department','Section','Description']], use_container_width=True)
-            else:
-                st.info("No departments found")
-
-    # ---- Workers Tab ----
-    with tab4:
-        st.subheader("Worker Management")
-        sections_df = read_table("sections")
-        departments_df = read_table("departments")
-        shifts_df = read_table("shifts")
-        workers_df = read_table("workers")
-
-        for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-            if c not in workers_df.columns:
-                workers_df[c] = default
-
-        col1, col2 = st.columns([2,3])
-
-        with col1:
-            st.markdown("#### 📤 Upload Workers from Excel (.xlsx)")
-            # Download a blank template
-            st.download_button(
-                "⬇️ Download Workers Template",
-                data=worker_template_excel_bytes(),
-                file_name="workers_template.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                help="Template columns: Name, Section, Department, Shift, Active"
-            )
-
-            uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"], key="admin_upload_workers")
-            if uploaded_file is not None:
-                try:
-                    uploaded_df = pd.read_excel(uploaded_file)
-                    required_cols = {"Name","Section","Department","Shift"}
-                    if not required_cols.issubset(uploaded_df.columns):
-                        st.error("Excel must contain columns: Name, Section, Department, Shift")
-                    else:
-                        wdf = read_table("workers")
-                        if wdf.empty:
-                            wdf = pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active'])
-                        for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-                            if c not in wdf.columns:
-                                wdf[c] = default
-
-                        def is_dup(row):
-                            return ((wdf['Name'] == row['Name']) &
-                                    (wdf['Section'] == row['Section']) &
-                                    (wdf['Department'] == row['Department']) &
-                                    (wdf['Shift'] == row['Shift'])).any()
-
-                        new_rows = []
-                        next_id = int(wdf['ID'].max())+1 if not wdf.empty and 'ID' in wdf.columns else 1
-                        for _, r in uploaded_df.iterrows():
-                            if not is_dup(r):
-                                new_rows.append({
-                                    'ID': next_id, 'Name': r['Name'], 'Section': r['Section'],
-                                    'Department': r['Department'], 'Shift': r['Shift'], 'Active': True
-                                })
-                                next_id += 1
-
-                        if not new_rows:
-                            st.warning("All uploaded workers already exist. No new workers added.")
-                        else:
-                            add_df = pd.DataFrame(new_rows)
-                            wdf = pd.concat([wdf, add_df], ignore_index=True)
-                            if write_table("workers", wdf):
-                                st.success(f"Added {len(add_df)} new workers")
-                                st.rerun()
-                except Exception as e:
-                    st.error(f"Error reading Excel file: {e}")
-
-            st.markdown("#### ➕ Add Single Worker (Admin)")
-            with st.form("add_worker_admin"):
-                w_name = st.text_input("Name")
-                w_section = st.selectbox("Section", sections_df['Name'].tolist() if not sections_df.empty else [], key="admin_add_section")
-
-                if w_section and not sections_df.empty:
-                    section_id = sections_df[sections_df['Name'] == w_section]['ID'].values[0]
-                    dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
-                else:
-                    dept_options = []
-
-                w_department = st.selectbox("Department", dept_options, key="admin_add_department")
-                w_shift = st.selectbox("Shift", shifts_df['Name'].tolist() if not shifts_df.empty else [], key="admin_add_shift")
-
-                if st.form_submit_button("Add Worker"):
-                    if w_name and w_section and w_department and w_shift:
-                        wdf = read_table("workers")
-                        for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-                            if c not in wdf.columns:
-                                wdf[c] = default
-                        new_id = int(wdf['ID'].max())+1 if not wdf.empty and 'ID' in wdf.columns else 1
-                        new_worker = pd.DataFrame([{
-                            'ID': new_id, 'Name': w_name, 'Section': w_section,
-                            'Department': w_department, 'Shift': w_shift, 'Active': True
-                        }])
-                        wdf = pd.concat([wdf, new_worker], ignore_index=True)
-                        if write_table("workers", wdf):
-                            st.success("Worker added")
-                            st.rerun()
-                    else:
-                        st.error("Fill all fields")
-
-        with col2:
-            st.markdown("#### 📋 All Workers")
-            wdf = read_table("workers")
-            for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-                if c not in wdf.columns:
-                    wdf[c] = default
-            wdf['Active'] = wdf['Active'].astype(str)
-            st.write(f"**Total: {len(wdf)} workers**")
-            # Export list
-            st.download_button(
-                "📥 Download Workers Excel",
-                data=dataframe_to_excel_bytes(wdf),
-                file_name="workers.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-            st.markdown("---")
-            for _, w in wdf.iterrows():
-                tag = '✅' if w['Active'].lower() in ['true','1','yes'] else '❌'
-                with st.expander(f"{tag} {w['Name']} - {w['Section']} / {w['Department']} ({w['Shift']})"):
-                    st.write(f"ID: {w['ID']}")
-                    colA, colB, colC = st.columns([2,1,1])
-                    with colA:
-                        if st.button("Deactivate" if w['Active'].lower() in ['true','1','yes'] else "Activate",
-                                     key=f"toggle_worker_{w['ID']}"):
-                            df = read_table("workers")
-                            for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-                                if c not in df.columns: df[c] = default
-                            df.loc[df['ID'] == w['ID'], 'Active'] = not (w['Active'].lower() in ['true','1','yes'])
-                            write_table("workers", df)
-                            st.rerun()
-                    with colB:
-                        # no-op spacer
-                        st.write("")
-                    with colC:
-                        if st.button("🗑️ Delete", key=f"del_worker_{w['ID']}"):
-                            df = read_table("workers")
-                            df = df[df['ID'] != w['ID']]
-                            write_table("workers", df)
-                            st.rerun()
-
-    # ---- Attendance Tab (Admin view) ----
-    with tab5:
-        st.subheader("📊 Attendance Records")
-        att = read_table("attendance")
-        if not att.empty and 'Date' in att.columns:
-            att['Date'] = pd.to_datetime(att['Date']).dt.date
-            view_date = st.date_input("Select Date", datetime.date.today(), key="admin_view_date")
-            filtered = att[att['Date'] == view_date]
-            if not filtered.empty:
-                st.write(f"Attendance for {view_date.strftime('%B %d, %Y')}")
-                st.dataframe(filtered[['Worker_Name','Section','Department','Shift','Status','Timestamp']], use_container_width=True)
-                total = len(filtered)
-                present = (filtered['Status'] == 'Present').sum()
-                absent = (filtered['Status'] == 'Absent').sum()
-                late = (filtered['Status'] == 'Late').sum()
-                leave = (filtered['Status'] == 'Leave').sum()
-                c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Present", present, f"{present/total*100:.1f}%")
-                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%")
-                with c3: st.metric("Late", late, f"{late/total*100:.1f}%")
-                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%")
-                st.download_button(
-                    "📥 Download Attendance CSV",
-                    filtered.to_csv(index=False).encode("utf-8"),
-                    file_name=f"attendance_{view_date}.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.info("No attendance records for selected date.")
-        else:
-            st.info("No attendance data yet or 'Date' column missing.")
-
-    # ---- Delete Data Tab ----
-    with tab6:
-        st.subheader("Danger Zone - Delete Data")
-        if st.button("Clear All Attendance", key="clear_attendance"):
-            write_table("attendance", pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp']))
-            st.success("Attendance cleared")
-        if st.button("Clear All Workers", key="clear_workers"):
-            write_table("workers", pd.DataFrame(columns=['ID','Name','Section','Department','Shift','Active']))
-            st.success("Workers cleared")
-        if st.button("Clear All Departments", key="clear_departments"):
-            write_table("departments", pd.DataFrame(columns=['ID','Name','Section_ID','Description']))
-            st.success("Departments cleared")
-        if st.button("Clear All Sections", key="clear_sections"):
-            write_table("sections", pd.DataFrame(columns=['ID','Name','Description']))
-            st.success("Sections cleared")
-
-# ==================== SUPERVISOR DASHBOARD ====================
-def supervisor_dashboard():
-    st.title("👷 Supervisor Dashboard")
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["✅ Mark Attendance", "📊 Attendance Register", "🔄 Transfer Workers",
-         "👥 Manage Workers", "📅 View Attendance", "📊 Attendance Grid"]
-    )
-
-    sections_df = read_table("sections")
-    departments_df = read_table("departments")
-    shifts_df = read_table("shifts")
-    workers_df = read_table("workers")
-    for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-        if c not in workers_df.columns:
-            workers_df[c] = default
-
-    # ---------- TAB 1: Mark Attendance ----------
-    with tab1:
-        st.subheader("✅ Mark Attendance")
-        mark_date = st.date_input("Select Date for Attendance", datetime.date.today(), key="mark_date")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            selected_section = st.selectbox("Select Section", ["All"] + (sections_df['Name'].tolist() if not sections_df.empty else []), key="mark_section")
-            if selected_section != "All" and not sections_df.empty:
-                section_id = sections_df[sections_df['Name'] == selected_section]['ID'].values[0]
-                dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
-            else:
-                dept_options = ["All"]
-            selected_department = st.selectbox("Select Department", dept_options, key="mark_department")
-        with col2:
-            selected_shift = st.selectbox("Select Shift", ["All"] + (shifts_df['Name'].tolist() if not shifts_df.empty else []), key="mark_shift")
-
-        wdf = read_table("workers")
-        for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-            if c not in wdf.columns:
-                wdf[c] = default
-        wdf["Active"] = wdf["Active"].astype(str)
-        filtered = wdf.copy()
-
-        if selected_section != "All": filtered = filtered[filtered["Section"] == selected_section]
-        if selected_department != "All": filtered = filtered[filtered["Department"] == selected_department]
-        if selected_shift != "All": filtered = filtered[filtered["Shift"] == selected_shift]
-        filtered = filtered[filtered["Active"].str.lower().isin(["true","1","yes"])]
-
-        if filtered.empty:
-            st.info("No active workers for selected filters.")
-        else:
-            st.write(f"### 📋 Mark Attendance for {mark_date.strftime('%B %d, %Y')} ({len(filtered)} workers)")
-            att_df = read_table("attendance")
-            if not att_df.empty and "Date" in att_df.columns:
-                att_df["Date"] = pd.to_datetime(att_df["Date"]).dt.date
-                existing_att = att_df[(att_df["Date"] == mark_date) & (att_df["Worker_ID"].astype(str).isin(filtered["ID"].astype(str)))]
-            else:
-                existing_att = pd.DataFrame()
-
-            with st.form("mark_attendance_form"):
-                statuses = {}
-                for _, worker in filtered.iterrows():
-                    worker_id_str = str(worker["ID"])
-                    worker_name = worker["Name"]
-                    worker_section = worker.get("Section","")
-                    worker_department = worker.get("Department","")
-                    worker_shift = worker.get("Shift","")
-                    if not existing_att.empty and "Worker_ID" in existing_att.columns:
-                        worker_att = existing_att[existing_att["Worker_ID"].astype(str) == worker_id_str]
-                        if not worker_att.empty and "Status" in worker_att.columns:
-                            current_status = worker_att.iloc[0]["Status"]
-                            default_idx = ["Present","Absent","Late","Leave"].index(current_status) if current_status in ["Present","Absent","Late","Leave"] else 0
-                        else:
-                            default_idx = 0
-                    else:
-                        default_idx = 0
-
-                    st.write(f"**{worker_name}** - {worker_section} / {worker_department} / {worker_shift}")
-                    status = st.radio("Status", ["Present","Absent","Late","Leave"], index=default_idx,
-                                      key=f"stat_{worker['ID']}", horizontal=True, label_visibility="collapsed")
-                    statuses[int(worker["ID"])] = {
-                        'name': worker_name, 'status': status,
-                        'section': worker_section, 'department': worker_department, 'shift': worker_shift
-                    }
-
-                if st.form_submit_button("Submit Attendance"):
-                    if att_df.empty:
-                        att_df = pd.DataFrame(columns=['ID','Worker_ID','Worker_Name','Date','Section','Department','Shift','Status','Timestamp'])
-                    next_id = int(att_df['ID'].max())+1 if not att_df.empty and 'ID' in att_df.columns else 1
-                    date_str = mark_date.strftime('%Y-%m-%d')
-                    new_records = []
-
-                    for wid, info in statuses.items():
-                        worker_id_str = str(wid)
-                        if not existing_att.empty and "Worker_ID" in existing_att.columns:
-                            existing_record = existing_att[existing_att["Worker_ID"].astype(str) == worker_id_str]
-                            if not existing_record.empty:
-                                record_id = existing_record.iloc[0]["ID"]
-                                att_df.loc[att_df["ID"] == record_id, "Status"] = info["status"]
-                                att_df.loc[att_df["ID"] == record_id, "Timestamp"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            else:
-                                new_records.append({
-                                    'ID': next_id,
-                                    'Worker_ID': wid,
-                                    'Worker_Name': info['name'],
-                                    'Date': date_str,
-                                    'Section': info['section'],
-                                    'Department': info['department'],
-                                    'Shift': info['shift'],
-                                    'Status': info['status'],
-                                    'Timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                })
-                                next_id += 1
-                        else:
-                            new_records.append({
-                                'ID': next_id,
-                                'Worker_ID': wid,
-                                'Worker_Name': info['name'],
-                                'Date': date_str,
-                                'Section': info['section'],
-                                'Department': info['department'],
-                                'Shift': info['shift'],
-                                'Status': info['status'],
-                                'Timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            })
-                            next_id += 1
-
-                    if new_records:
-                        new_att = pd.DataFrame(new_records)
-                        att_df = pd.concat([att_df, new_att], ignore_index=True)
-
-                    if write_table("attendance", att_df):
-                        st.success(f"Updated attendance for {len(filtered)} workers")
-                        st.rerun()
-
-    # ---------- TAB 2: Attendance Register ----------
-    with tab2:
-        st.subheader("📊 Attendance Register")
-        reg_date = st.date_input("Select Date for Register", datetime.date.today(), key="reg_date")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            reg_section = st.selectbox("Select Section", ["All"] + (sections_df['Name'].tolist() if not sections_df.empty else []), key="reg_section")
-            if reg_section != "All" and not sections_df.empty:
-                section_id = sections_df[sections_df['Name'] == reg_section]['ID'].values[0]
-                dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
-            else:
-                dept_options = ["All"]
-            reg_department = st.selectbox("Select Department", dept_options, key="reg_department")
-        with col2:
-            reg_shift = st.selectbox("Select Shift", ["All"] + (shifts_df['Name'].tolist() if not shifts_df.empty else []), key="reg_shift")
-
-        att = read_table("attendance")
-        if not att.empty and "Date" in att.columns:
-            att["Date"] = pd.to_datetime(att["Date"]).dt.date
-            filtered = att[att["Date"] == reg_date]
-            if reg_section != "All": filtered = filtered[filtered["Section"] == reg_section]
-            if reg_department != "All": filtered = filtered[filtered["Department"] == reg_department]
-            if reg_shift != "All": filtered = filtered[filtered["Shift"] == reg_shift]
-
-            if not filtered.empty:
-                st.write(f"### Attendance Register for {reg_date.strftime('%B %d, %Y')}")
-                editable_df = filtered.copy()
-                editable_df["Edit"] = False
-                edited_df = st.data_editor(
-                    editable_df[['Worker_Name','Section','Department','Shift','Status','Timestamp','Edit']],
-                    use_container_width=True,
-                    column_config={
-                        "Worker_Name": st.column_config.TextColumn("Worker Name", disabled=True),
-                        "Section": st.column_config.TextColumn("Section", disabled=True),
-                        "Department": st.column_config.TextColumn("Department", disabled=True),
-                        "Shift": st.column_config.TextColumn("Shift", disabled=True),
-                        "Status": st.column_config.TextColumn("Status", disabled=True),
-                        "Timestamp": st.column_config.TextColumn("Timestamp", disabled=True),
-                        "Edit": st.column_config.CheckboxColumn("Edit for Changes")
-                    },
-                    hide_index=True
-                )
-                records_to_edit = edited_df[edited_df["Edit"] == True]
-                if not records_to_edit.empty:
-                    st.subheader("Edit Selected Records")
-                    with st.form("edit_attendance_form"):
-                        for idx, record in records_to_edit.iterrows():
-                            worker_name = record["Worker_Name"]
-                            current_status = record["Status"]
-                            original_record = filtered[filtered["Worker_Name"] == worker_name]
-                            if not original_record.empty:
-                                record_id = original_record.iloc[0]["ID"]
-                                new_status = st.radio(
-                                    f"{worker_name} — New Status",
-                                    ["Present","Absent","Late","Leave"],
-                                    index=["Present","Absent","Late","Leave"].index(current_status) if current_status in ["Present","Absent","Late","Leave"] else 0,
-                                    key=f"edit_status_{record_id}"
-                                )
-                                st.session_state[f"edit_status_{record_id}"] = new_status
-                            st.divider()
-                        if st.form_submit_button("Save Changes"):
-                            att_df = read_table("attendance")
-                            for idx, record in records_to_edit.iterrows():
-                                worker_name = record["Worker_Name"]
-                                original_record = filtered[filtered["Worker_Name"] == worker_name]
-                                if not original_record.empty:
-                                    record_id = original_record.iloc[0]["ID"]
-                                    new_status = st.session_state[f"edit_status_{record_id}"]
-                                    att_df.loc[att_df["ID"] == record_id, "Status"] = new_status
-                                    att_df.loc[att_df["ID"] == record_id, "Timestamp"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            if write_table("attendance", att_df):
-                                st.success("Attendance records updated successfully!")
-                                st.rerun()
-
-                total = len(filtered)
-                present = (filtered['Status'] == 'Present').sum()
-                absent = (filtered['Status'] == 'Absent').sum()
-                late = (filtered['Status'] == 'Late').sum()
-                leave = (filtered['Status'] == 'Leave').sum()
-                c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Present", present, f"{present/total*100:.1f}%")
-                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%")
-                with c3: st.metric("Late", late, f"{late/total*100:.1f}%")
-                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%")
-
-                st.download_button(
-                    "📥 Download Attendance CSV",
-                    filtered.to_csv(index=False).encode("utf-8"),
-                    file_name=f"attendance_{reg_date}.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.info("No attendance records for selected filters.")
-        else:
-            st.info("No attendance data")
-
-    # ---------- TAB 3: Transfer Workers ----------
-    with tab3:
-        st.subheader("🔄 Transfer Workers")
-        wdf = read_table("workers")
-        for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-            if c not in wdf.columns:
-                wdf[c] = default
-        if not wdf.empty:
-            active = wdf[wdf["Active"].astype(str).str.lower().isin(["true","1","yes"])]
-            if not active.empty:
-                sel = st.selectbox("Select Worker", active["Name"].tolist(), key="transfer_worker")
-                row = active[active["Name"] == sel].iloc[0]
-                st.write(f"Current: {row.get('Section','')} / {row.get('Department','')} - {row.get('Shift','')}")
-                col1, col2, _ = st.columns(3)
-                with col1:
-                    new_section = st.selectbox("New Section", sections_df['Name'].tolist(), key="new_section")
-                    if new_section and not sections_df.empty:
-                        section_id = sections_df[sections_df['Name'] == new_section]['ID'].values[0]
-                        dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
-                    else:
-                        dept_options = []
-                    new_department = st.selectbox("New Department", dept_options, key="new_department")
-                with col2:
-                    new_shift = st.selectbox("New Shift", shifts_df['Name'].tolist(), key="new_shift")
-                if st.button("Transfer Worker", key="transfer_btn"):
-                    wdf.loc[wdf['ID']==row['ID'],'Section'] = new_section
-                    wdf.loc[wdf['ID']==row['ID'],'Department'] = new_department
-                    wdf.loc[wdf['ID']==row['ID'],'Shift'] = new_shift
-                    write_table("workers", wdf)
-                    st.success("Transferred")
-            else:
-                st.info("No active workers")
-        else:
-            st.info("No workers found")
-
-    # ---------- TAB 4: Manage Workers ----------
-    with tab4:
-        st.subheader("👥 Manage Workers")
-        wdf = read_table("workers")
-        for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-            if c not in wdf.columns:
-                wdf[c] = default
-        if not wdf.empty:
-            for _, w in wdf.iterrows():
-                tag = '✅' if str(w['Active']).lower() in ['true','1','yes'] else '❌'
-                with st.expander(f"{tag} {w['Name']} - {w.get('Section','')} / {w.get('Department','')} ({w.get('Shift','')})"):
-                    st.write(f"ID: {w['ID']}")
-                    st.write(f"Section: {w.get('Section','')} | Department: {w.get('Department','')} | Shift: {w.get('Shift','')}")
-                    col1, col2 = st.columns([3,1])
-                    with col1:
-                        if str(w['Active']).lower() in ['true','1','yes']:
-                            if st.button("Deactivate", key=f"sup_deact_{w['ID']}"):
-                                df = read_table("workers")
-                                for c2, default2 in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-                                    if c2 not in df.columns: df[c2] = default2
-                                df.loc[df['ID']==w['ID'],'Active'] = False
-                                write_table("workers", df)
-                                st.rerun()
-                        else:
-                            if st.button("Activate", key=f"sup_act_{w['ID']}"):
-                                df = read_table("workers")
-                                for c2, default2 in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-                                    if c2 not in df.columns: df[c2] = default2
-                                df.loc[df['ID']==w['ID'],'Active'] = True
-                                write_table("workers", df)
-                                st.rerun()
-                    with col2:
-                        if st.button("🗑️ Delete", key=f"sup_del_{w['ID']}"):
-                            df = read_table("workers")
-                            df = df[df['ID'] != w['ID']]
-                            write_table("workers", df)
-                            st.rerun()
-        else:
-            st.info("No workers found")
-
-    # ---------- TAB 5: View Attendance ----------
-    with tab5:
-        st.subheader("📅 View Attendance")
-        att = read_table("attendance")
-        if not att.empty and "Date" in att.columns:
-            att["Date"] = pd.to_datetime(att["Date"]).dt.date
-            view_date = st.date_input("Date", datetime.date.today(), key="sup_view_date")
-            view_section = st.selectbox("Section", ["All"] + (sections_df['Name'].tolist() if not sections_df.empty else []), key="sup_view_section")
-            if view_section != "All" and not sections_df.empty:
-                section_id = sections_df[sections_df['Name'] == view_section]['ID'].values[0]
-                dept_options = departments_df[departments_df['Section_ID'] == section_id]['Name'].tolist() if not departments_df.empty else []
-            else:
-                dept_options = ["All"]
-            view_department = st.selectbox("Department", dept_options, key="sup_view_department")
-            view_shift = st.selectbox("Shift", ["All"] + (shifts_df['Name'].tolist() if not shifts_df.empty else []), key="sup_view_shift")
-
-            filtered = att[att["Date"] == view_date]
-            if view_section != "All": filtered = filtered[filtered["Section"] == view_section]
-            if view_department != "All": filtered = filtered[filtered["Department"] == view_department]
-            if view_shift != "All": filtered = filtered[filtered["Shift"] == view_shift]
-
-            if not filtered.empty:
-                st.write(f"### Attendance Register - {view_date.strftime('%B %d, %Y')}")
-                st.dataframe(filtered[['Worker_Name','Section','Department','Shift','Status','Timestamp']], use_container_width=True)
-                total = len(filtered)
-                present = (filtered['Status']=='Present').sum()
-                absent = (filtered['Status']=='Absent').sum()
-                late = (filtered['Status']=='Late').sum()
-                leave = (filtered['Status']=='Leave').sum()
-                c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Present", present, f"{present/total*100:.1f}%")
-                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%")
-                with c3: st.metric("Late", late, f"{late/total*100:.1f}%")
-                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%")
-            else:
-                st.info("No records found")
-        else:
-            st.info("No attendance data or 'Date' column missing.")
-
-    # ---------- TAB 6: Attendance Grid ----------
-    with tab6:
-        st.subheader("📊 Attendance Grid")
-        col1, col2 = st.columns(2)
-        with col1:
-            year = st.selectbox("Year", list(range(2020, datetime.date.today().year + 2)),
-                                index=list(range(2020, datetime.date.today().year + 2)).index(datetime.date.today().year),
-                                key="sup_grid_year")
-        with col2:
-            month = st.selectbox("Month", list(range(1, 13)),
-                                 index=datetime.date.today().month - 1,
-                                 key="sup_grid_month")
-        grid_df = generate_attendance_grid(year, month)
-        if not grid_df.empty:
-            st.markdown('<div class="attendance-grid">', unsafe_allow_html=True)
-            st.dataframe(
-                grid_df,
-                use_container_width=True,
-                column_config={
-                    "Name": st.column_config.TextColumn("Name", width="medium"),
-                    "Section": st.column_config.TextColumn("Section", width="small"),
-                    "Department": st.column_config.TextColumn("Department", width="small"),
-                    "Shift": st.column_config.TextColumn("Shift", width="small"),
-                    "Present Days": st.column_config.NumberColumn("Present Days", format="%d"),
-                    "Attendance %": st.column_config.NumberColumn("Attendance %", format="%.1f%%")
-                }
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-            st.download_button(
-                "📥 Download Attendance Grid",
-                data=dataframe_to_excel_bytes(grid_df),
-                file_name=f"attendance_grid_{year}_{month}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.info("No attendance data available for the selected period.")
-
-# ==================== HR DASHBOARD ====================
-def hr_dashboard():
-    st.title("📊 HR Dashboard")
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Daily","📅 Monthly","👥 Directory", "📊 Attendance Grid"])
-    sections_df = read_table("sections")
-    departments_df = read_table("departments")
-    workers_df = read_table("workers")
-    attendance_df = read_table("attendance")
-
-    for c, default in [("Active", True), ("Section",""), ("Department",""), ("Shift","")]:
-        if c not in workers_df.columns:
-            workers_df[c] = default
-
-    with tab1:
-        st.subheader("📊 Daily Attendance")
-        view_date = st.date_input("Date", datetime.date.today(), key="hr_daily_date")
-        if not attendance_df.empty and "Date" in attendance_df.columns:
-            attendance_df["Date"] = pd.to_datetime(attendance_df["Date"]).dt.date
-            filtered = attendance_df[attendance_df["Date"] == view_date]
-            if not filtered.empty:
-                st.dataframe(filtered[['Worker_Name','Section','Department','Shift','Status','Timestamp']], use_container_width=True)
-                total = len(filtered)
-                present = (filtered['Status']=='Present').sum()
-                absent = (filtered['Status']=='Absent').sum()
-                late = (filtered['Status']=='Late').sum()
-                leave = (filtered['Status']=='Leave').sum()
-                c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Present", present, f"{present/total*100:.1f}%")
-                with c2: st.metric("Absent", absent, f"{absent/total*100:.1f}%")
-                with c3: st.metric("Late", late, f"{late/total*100:.1f}%")
-                with c4: st.metric("Leave", leave, f"{leave/total*100:.1f}%")
-            else:
-                st.info("No attendance records for date")
-        else:
-            st.info("No attendance data")
-
-    with tab2:
-        st.subheader("📅 Monthly Analysis")
-        year = st.selectbox("Year", list(range(2023, datetime.date.today().year+2)),
-                            index=list(range(2023, datetime.date.today().year+2)).index(datetime.date.today().year),
-                            key="hr_monthly_year")
-        month = st.selectbox("Month", list(range(1,13)),
-                             index=datetime.date.today().month-1,
-                             key="hr_monthly_month")
-        if not attendance_df.empty and "Date" in attendance_df.columns:
-            attendance_df["Date"] = pd.to_datetime(attendance_df["Date"])
-            monthly = attendance_df[
-                (attendance_df["Date"].dt.year == year) &
-                (attendance_df["Date"].dt.month == month)
-            ]
-            if not monthly.empty:
-                worker_stats = monthly.groupby('Worker_Name').agg(
-                    Present=('Status', lambda x: (x=='Present').sum()),
-                    Absent=('Status', lambda x: (x=='Absent').sum()),
-                    Late=('Status', lambda x: (x=='Late').sum()),
-                    Leave=('Status', lambda x: (x=='Leave').sum()),
-                    Total=('Status', 'count')
-                ).reset_index()
-                worker_stats['Attendance %'] = (worker_stats['Present'] / worker_stats['Total'] * 100).round(1)
-
-                worker_details = workers_df[['Name','Section','Department','Shift']].copy()
-                worker_stats = worker_stats.merge(
-                    worker_details, left_on='Worker_Name', right_on='Name', how='left'
-                ).drop('Name', axis=1)
-
-                st.dataframe(worker_stats, use_container_width=True)
-
-                total_records = len(monthly)
-                total_present = (monthly['Status']=='Present').sum()
-                total_absent = (monthly['Status']=='Absent').sum()
-                total_late = (monthly['Status']=='Late').sum()
-                total_leave = (monthly['Status']=='Leave').sum()
-                c1,c2,c3,c4 = st.columns(4)
-                with c1: st.metric("Total Records", total_records)
-                with c2: st.metric("Present", total_present, f"{total_present/total_records*100:.1f}%")
-                with c3: st.metric("Absent", total_absent, f"{total_absent/total_records*100:.1f}%")
-                with c4: st.metric("Late", total_late, f"{total_late/total_records*100:.1f}%")
-
-                st.download_button(
-                    "📥 Download Monthly Report",
-                    worker_stats.to_csv(index=False).encode("utf-8"),
-                    file_name=f"monthly_attendance_{year}_{month}.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.info("No attendance records for selected month")
-        else:
-            st.info("No attendance data")
-
-    with tab3:
-        st.subheader("👥 Worker Directory")
-        if not workers_df.empty:
-            workers_df['Active'] = workers_df['Active'].astype(str)
-            active_workers = workers_df[workers_df['Active'].str.lower().isin(['true','1','yes'])]
-            if not active_workers.empty:
-                st.dataframe(
-                    active_workers[['Name','Section','Department','Shift']],
-                    use_container_width=True,
-                    column_config={
-                        "Name": st.column_config.TextColumn("Name"),
-                        "Section": st.column_config.TextColumn("Section"),
-                        "Department": st.column_config.TextColumn("Department"),
-                        "Shift": st.column_config.TextColumn("Shift")
-                    },
-                    hide_index=True
-                )
-                st.download_button(
-                    "📥 Download Worker Directory",
-                    dataframe_to_excel_bytes(active_workers[['Name','Section','Department','Shift']]),
-                    file_name="worker_directory.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.info("No active workers found")
-        else:
-            st.info("No workers found")
-
-    with tab4:
-        st.subheader("📊 Attendance Grid")
-        col1, col2 = st.columns(2)
-        with col1:
-            year = st.selectbox("Year", list(range(2020, datetime.date.today().year + 2)),
-                                index=list(range(2020, datetime.date.today().year + 2)).index(datetime.date.today().year),
-                                key="hr_grid_year")
-        with col2:
-            month = st.selectbox("Month", list(range(1, 13)),
-                                 index=datetime.date.today().month - 1,
-                                 key="hr_grid_month")
-        grid_df = generate_attendance_grid(year, month)
-        if not grid_df.empty:
-            st.markdown('<div class="attendance-grid">', unsafe_allow_html=True)
-            st.dataframe(
-                grid_df,
-                use_container_width=True,
-                column_config={
-                    "Name": st.column_config.TextColumn("Name", width="medium"),
-                    "Section": st.column_config.TextColumn("Section", width="small"),
-                    "Department": st.column_config.TextColumn("Department", width="small"),
-                    "Shift": st.column_config.TextColumn("Shift", width="small"),
-                    "Present Days": st.column_config.NumberColumn("Present Days", format="%d"),
-                    "Attendance %": st.column_config.NumberColumn("Attendance %", format="%.1f%%")
-                }
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-            st.download_button(
-                "📥 Download Attendance Grid",
-                dataframe_to_excel_bytes(grid_df),
-                file_name=f"attendance_grid_{year}_{month}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.info("No attendance data available for the selected period.")
-
-# ==================== MAIN APP ====================
 def main():
-    st.markdown(mobile_responsive_css(), unsafe_allow_html=True)
-    initialize_system()
+    st.set_page_config(page_title="Attendance", page_icon="🗂️", layout="wide")
+    st.markdown(mobile_css(), unsafe_allow_html=True)
 
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
+    # Initialize databases and seed defaults
+    initialize_databases()
+    ensure_seed_data()
 
-    if not st.session_state.logged_in:
-        login_page()
-    else:
-        with st.sidebar:
-            st.write(f"Logged in as: **{st.session_state['username']}** ({st.session_state['role']})")
-            # live DB ping
-            try:
-                eng = get_db_connection()
-                with eng.connect() as conn:
-                    now = conn.execute(text("SELECT NOW()")).scalar()
-                st.success(f"🟢 DB OK — {now}")
-            except Exception as e:
-                st.error(f"🔴 DB issue: {e}")
+    # Sidebar status + manual sync
+    with st.sidebar:
+        if is_online():
+            # perform a quick sync from offline → online
+            nw, na = sync_from_sqlite_to_supabase()
+            # status
+            eng = get_online_engine_or_none()
+            with eng.connect() as conn:
+                now = conn.execute(text("SELECT NOW()")).scalar()
+            st.success(f"🟢 Online (Supabase Pooler)\n{now}")
+            if nw or na:
+                st.info(f"Synced: {nw} worker(s), {na} attendance record(s)")
+        else:
+            eng = get_offline_engine()
+            with eng.connect() as conn:
+                now = conn.execute(text("SELECT datetime('now')")).scalar()
+            st.warning(f"🔵 Offline (SQLite)\n{now}")
+
+        if st.button("🔄 Sync Now"):
+            if is_online():
+                nw, na = sync_from_sqlite_to_supabase()
+                st.success(f"Synced {nw} worker(s), {na} attendance record(s)")
+            else:
+                st.info("Still offline — will sync when online.")
+
+        st.markdown("---")
+        if st.session_state.get("logged_in"):
+            st.write(f"👤 {st.session_state['username']} ({st.session_state['role']})")
             if st.button("Logout"):
                 logout()
                 st.rerun()
 
-        role = st.session_state["role"]
-        if role == "Admin":
-            admin_dashboard()
-        elif role == "Supervisor":
-            supervisor_dashboard()
-        elif role == "HR":
-            hr_dashboard()
-        else:
-            st.error("Invalid role. Please contact administrator.")
+    if not st.session_state.get("logged_in"):
+        login_page()
+        return
+
+    role = st.session_state.get("role","Admin")
+    if role == "Admin":
+        admin_dashboard()
+    elif role == "Supervisor":
+        supervisor_dashboard()
+    elif role == "HR":
+        hr_dashboard()
+    else:
+        st.error("Invalid role")
 
 if __name__ == "__main__":
     main()
