@@ -460,17 +460,55 @@ def admin_dashboard():
 
     # ---- Departments ----
     with tab3:
-        st.subheader("Departments Management")
         sections_df = read_table("sections")
-        departments_df = read_table("departments")
-        col1, col2 = st.columns([2,3])
-        with col1:
-            st.markdown("#### ➕ Add Department")
-            with st.form("add_department"):
-                dept_name = st.text_input("Department Name")
-                section_id = st.selectbox("Section", sections_df['ID'].tolist() if not sections_df.empty else [], key="dept_section")
-                desc = st.text_area("Description")
-                if st.form_submit_button("Add Department"):
+departments_df = read_table("departments")
+
+# ✅ Auto-heal missing columns in sections
+expected_sec_cols = ["ID","Name","Description"]
+missing_sec = [c for c in expected_sec_cols if c not in sections_df.columns]
+if missing_sec or sections_df.empty:
+    st.warning("⚙️ Rebuilding sections table (missing columns or empty)")
+    initialize_databases()
+    seed_defaults()
+    sections_df = read_table("sections")
+
+# ✅ Auto-heal missing columns in departments
+expected_dept_cols = ["ID","Name","Section_ID","Description"]
+missing_dept = [c for c in expected_dept_cols if c not in departments_df.columns]
+if missing_dept:
+    st.warning("⚙️ Rebuilding departments table (missing columns)")
+    initialize_databases()
+    seed_defaults()
+    departments_df = read_table("departments")
+
+col1, col2 = st.columns([2,3])
+with col1:
+    st.markdown("#### ➕ Add Department")
+    with st.form("add_department"):
+        dept_name = st.text_input("Department Name")
+        section_id = st.selectbox(
+            "Section",
+            sections_df['ID'].tolist() if "ID" in sections_df.columns and not sections_df.empty else [],
+            key="dept_section"
+        )
+        desc = st.text_area("Description")
+        if st.form_submit_button("Add Department"):
+            if dept_name and section_id:
+                df = read_table("departments")
+                new_id = int(df['ID'].max())+1 if not df.empty and 'ID' in df.columns else 1
+                new_department = pd.DataFrame([{
+                    'ID': new_id,
+                    'Name': dept_name,
+                    'Section_ID': section_id,
+                    'Description': desc
+                }])
+                df = pd.concat([df, new_department], ignore_index=True)
+                if write_table_replace("departments", df):
+                    st.success("Department added")
+                    st.rerun()
+            else:
+                st.error("Enter department name and select section")
+
                     if dept_name and section_id:
                         df = read_table("departments")
                         new_id = int(df['ID'].max())+1 if not df.empty and 'ID' in df.columns else 1
